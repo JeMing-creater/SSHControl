@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+    <div>
+        <p class="eyebrow">总览</p>
+        <h2>通过 SSH 集中控制多宿主机容器分配、快照和资源准入</h2>
+        <p class="muted">平台按端口分配长期在线容器，默认共享 <code>/mnt</code>，支持 CPU / 内存在线调整，并展示宿主机 Docker 的真实状态。</p>
+    </div>
+</section>
+
+<section class="grid cards">
+    {% for card in host_cards %}
+    <article class="card">
+        <div class="card-head">
+            <div>
+                <p class="eyebrow">{{ card.host.address }}</p>
+                <h3>{{ card.host.name }}</h3>
+            </div>
+            <span class="status {{ 'ok' if card.summary.reachable else 'bad' }}">
+                {{ '在线' if card.summary.reachable else '离线' }}
+            </span>
+        </div>
+        <dl class="metrics">
+            <div>
+                <dt>端口范围</dt>
+                <dd>{{ card.host.port_start }} - {{ card.host.port_end }}</dd>
+            </div>
+            <div>
+                <dt>容器数</dt>
+                <dd>{{ card.summary.active_allocations }}</dd>
+            </div>
+            <div>
+                <dt>CPU 配额</dt>
+                <dd>{{ "%.1f"|format(card.summary.allocated_cpu) }} / {{ "%.1f"|format(card.total_cpu) if card.total_cpu else '-' }}</dd>
+            </div>
+            <div>
+                <dt>内存配额</dt>
+                <dd>{{ "%.1f"|format(card.summary.allocated_memory_gb) }} / {{ "%.1f"|format(card.total_memory_gb) if card.total_memory_gb else '-' }} GB</dd>
+            </div>
+        </dl>
+        <div class="gpu-list">
+            {% if card.summary.gpus %}
+                {% for gpu in card.summary.gpus %}
+                <div class="gpu-chip">
+                    <span>GPU {{ gpu.index }}</span>
+                    <strong>{{ gpu.utilization_gpu }}%</strong>
+                    <small>{{ gpu.memory_used_mb|int }} / {{ gpu.memory_total_mb|int }} MB</small>
+                </div>
+                {% endfor %}
+            {% else %}
+                <p class="muted">未获取到 GPU 状态</p>
+            {% endif %}
+        </div>
+        <div class="hero-actions">
+            <a class="button secondary" href="/hosts/{{ card.host.id }}">进入宿主机</a>
+            <form class="confirm-ajax-form" method="post" action="/hosts/{{ card.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？这不会删除远端服务器本身，只会删除平台记录。">
+                <button class="button danger" type="submit">移除记录</button>
+            </form>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+
+<section class="panel">
+    <div class="panel-head">
+        <div>
+            <p class="eyebrow">最近分配</p>
+            <h3>容器租约</h3>
+        </div>
+    </div>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>宿主机</th>
+                <th>端口</th>
+                <th>使用者</th>
+                <th>用途</th>
+                <th>镜像</th>
+                <th>CPU</th>
+                <th>内存</th>
+                <th>状态</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for allocation in allocations %}
+            <tr>
+                <td>{{ allocation.host.name }}</td>
+                <td>{{ allocation.host_port }}</td>
+                <td>{{ allocation.assignee }}</td>
+                <td>{{ allocation.purpose }}</td>
+                <td>{{ allocation.image_name }}</td>
+                <td>{{ allocation.cpu_limit_cores }}</td>
+                <td>{{ allocation.memory_limit_gb }} GB</td>
+                <td>{{ allocation.status }}</td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="8" class="muted">暂无分配记录</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

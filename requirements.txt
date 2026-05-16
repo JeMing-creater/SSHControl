@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sqlalchemy
+docker
+jinja2
+python-multipart
+pydantic-settings
+paramiko

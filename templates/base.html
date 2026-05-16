@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ settings.app_name }}</title>
+    <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+    <header class="topbar">
+        <div>
+            <p class="eyebrow">Docker Multi-Host Control</p>
+            <h1>{{ settings.app_name }}</h1>
+        </div>
+        <nav class="topnav">
+            <a href="/">总览</a>
+            <a href="/hosts">宿主机</a>
+            {% if admin and admin.get('is_root') %}
+            <a href="/admins">管理员</a>
+            {% endif %}
+            {% if admin %}
+            <form method="post" action="/logout">
+                <button class="nav-button" type="submit">退出 {{ admin.get('account') }}</button>
+            </form>
+            {% else %}
+            <a href="/login">登录</a>
+            <a href="/register">注册</a>
+            {% endif %}
+        </nav>
+    </header>
+    <main class="layout">
+        {% block content %}{% endblock %}
+    </main>
+    <section id="global-toast" class="toast hidden" aria-live="polite">
+        <div id="global-toast-body" class="toast-body"></div>
+    </section>
+    <section id="global-feedback-modal" class="modal hidden" aria-hidden="true">
+        <div class="modal-backdrop"></div>
+        <div class="modal-card">
+            <div class="panel-head">
+                <div>
+                    <p class="eyebrow">操作反馈</p>
+                    <h3 id="global-feedback-title">操作完成</h3>
+                </div>
+            </div>
+            <div class="form-grid">
+                <p id="global-feedback-message" class="wide muted"></p>
+                <label id="global-feedback-log-wrap" class="wide hidden">错误日志
+                    <textarea id="global-feedback-log" rows="10" readonly></textarea>
+                </label>
+                <div class="wide modal-actions">
+                    <button class="button secondary hidden" type="button" id="global-feedback-copy">复制日志</button>
+                    <button class="button" type="button" id="global-feedback-close">知道了</button>
+                </div>
+            </div>
+        </div>
+    </section>
+    <script>
+    (() => {
+        const modal = document.getElementById("global-feedback-modal");
+        const title = document.getElementById("global-feedback-title");
+        const message = document.getElementById("global-feedback-message");
+        const logWrap = document.getElementById("global-feedback-log-wrap");
+        const log = document.getElementById("global-feedback-log");
+        const copy = document.getElementById("global-feedback-copy");
+        const close = document.getElementById("global-feedback-close");
+        const toast = document.getElementById("global-toast");
+        const toastBody = document.getElementById("global-toast-body");
+        const logLines = [];
+        let timer = null;
+        let redirectUrl = "";
+        let reloadOnClose = false;
+
+        if (!modal) {
+            return;
+        }
+
+        const showToast = (text, type) => {
+            toast.classList.remove("hidden", "success", "error");
+            toast.classList.add(type);
+            toastBody.textContent = text;
+            if (timer) {
+                clearTimeout(timer);
+            }
+            timer = setTimeout(() => toast.classList.add("hidden"), 3600);
+        };
+
+        const showModal = (text, type = "success", errorLog = "", options = {}) => {
+            redirectUrl = options.redirectUrl || "";
+            reloadOnClose = Boolean(options.reloadOnClose);
+            title.textContent = type === "error" ? "操作失败" : "操作完成";
+            message.textContent = text;
+            if (type === "error" && errorLog) {
+                log.value = errorLog;
+                logWrap.classList.remove("hidden");
+                copy.classList.remove("hidden");
+            } else {
+                log.value = "";
+                logWrap.classList.add("hidden");
+                copy.classList.add("hidden");
+            }
+            modal.classList.remove("hidden");
+            modal.setAttribute("aria-hidden", "false");
+            showToast(text, type);
+        };
+
+        const appendLog = (line) => {
+            if (!line) {
+                return;
+            }
+            logLines.push(line);
+            if (!modal.classList.contains("hidden")) {
+                log.value = logLines.join("\n");
+            }
+        };
+
+        window.showGlobalFeedback = showModal;
+        window.appendGlobalFeedbackLog = appendLog;
+
+        close.addEventListener("click", () => {
+            modal.classList.add("hidden");
+            modal.setAttribute("aria-hidden", "true");
+            if (redirectUrl) {
+                window.location.href = redirectUrl;
+            } else if (reloadOnClose) {
+                window.location.reload();
+            }
+        });
+
+        copy.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(log.value);
+                showToast("错误日志已复制。", "success");
+            } catch (error) {
+                log.focus();
+                log.select();
+                showToast("自动复制失败，已选中错误日志，请手动复制。", "error");
+            }
+        });
+
+        document.querySelectorAll("form.confirm-ajax-form").forEach((form) => {
+            form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                const messageText = form.dataset.confirmMessage || "确认执行该操作？";
+                if (!window.confirm(messageText)) {
+                    return;
+                }
+                const submitButton = event.submitter || form.querySelector('button[type="submit"]');
+                const originalText = submitButton ? submitButton.textContent : "";
+                if (submitButton) {
+                    submitButton.disabled = true;
+                    submitButton.classList.add("is-busy");
+                    submitButton.textContent = "处理中...";
+                }
+                try {
+                    const response = await fetch(form.action, {
+                        method: form.method || "POST",
+                        body: new FormData(form),
+                        headers: {
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Accept": "application/json"
+                        }
+                    });
+                    const responseText = await response.text();
+                    let payload = null;
+                    try {
+                        payload = responseText ? JSON.parse(responseText) : {};
+                    } catch (error) {
+                        payload = {
+                            ok: false,
+                            message: `请求返回了非 JSON 内容，状态码 ${response.status}`,
+                            error_log: `POST ${form.action}\nHTTP ${response.status}\n\n${responseText.slice(0, 2000)}`
+                        };
+                    }
+                    if (Array.isArray(payload.logs)) {
+                        payload.logs.forEach((line) => appendLog(line));
+                    }
+                    if (response.ok && payload.ok) {
+                        showModal(
+                            payload.message || "操作已完成。",
+                            "success",
+                            "",
+                            {
+                                redirectUrl: payload.redirect_url || form.dataset.successRedirect || "",
+                                reloadOnClose: form.dataset.reloadOnClose !== "false"
+                            }
+                        );
+                    } else {
+                        showModal(payload.message || "操作失败。", "error", payload.error_log || "");
+                    }
+                } catch (error) {
+                    showModal("请求发送失败，请检查网络或后端状态。", "error", String(error));
+                } finally {
+                    if (submitButton) {
+                        submitButton.disabled = false;
+                        submitButton.classList.remove("is-busy");
+                        submitButton.textContent = originalText;
+                    }
+                }
+            });
+        });
+    })();
+    </script>
+</body>
+</html>

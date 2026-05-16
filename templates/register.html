@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel auth-panel">
+    <div class="panel-head">
+        <div>
+            <p class="eyebrow">管理员注册</p>
+            <h2>提交审批申请</h2>
+        </div>
+    </div>
+    {% if request.query_params.get('error') %}
+    <section class="banner bad">{{ request.query_params.get('error') }}</section>
+    {% endif %}
+    <form class="form-grid" method="post" action="/register">
+        <label><span class="required-mark">*</span>账号<input name="account" required></label>
+        <label><span class="required-mark">*</span>密码<input name="password" type="password" required></label>
+        <label><span class="required-mark">*</span>邮箱<input name="email" type="email" required></label>
+        <label><span class="required-mark">*</span>学号<input name="student_id" required></label>
+        <div class="wide action-row">
+            <button class="button" type="submit">提交注册申请</button>
+            <a class="button secondary" href="/login">返回登录</a>
+        </div>
+    </form>
+</section>
+{% endblock %}

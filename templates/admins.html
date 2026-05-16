@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+    <div class="panel-head">
+        <div>
+            <p class="eyebrow">管理员审批</p>
+            <h2>注册申请与权限管理</h2>
+        </div>
+    </div>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>账号</th>
+                <th>邮箱</th>
+                <th>学号</th>
+                <th>状态</th>
+                <th>申请时间</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for user in users %}
+            <tr>
+                <td>{{ user.account }}</td>
+                <td>{{ user.email }}</td>
+                <td>{{ user.student_id }}</td>
+                <td>{{ user.status }}</td>
+                <td>{{ user.created_at }}</td>
+                <td>
+                    <div class="action-row">
+                        {% if user.status != 'approved' %}
+                        <form method="post" action="/admins/{{ user.id }}/approve">
+                            <button class="button tiny" type="submit">允许注册</button>
+                        </form>
+                        {% endif %}
+                        {% if user.status == 'approved' %}
+                        <form method="post" action="/admins/{{ user.id }}/revoke">
+                            <button class="button tiny danger" type="submit">取消权限</button>
+                        </form>
+                        {% endif %}
+                    </div>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="6" class="muted">暂无注册申请</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

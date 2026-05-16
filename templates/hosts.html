@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="split">
+    <article class="panel">
+        <div class="panel-head">
+            <div>
+                <p class="eyebrow">宿主机列表</p>
+                <h2>受管宿主机</h2>
+            </div>
+        </div>
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>名称</th>
+                    <th>地址</th>
+                    <th>端口池</th>
+                    <th>默认建议值</th>
+                    <th>状态</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in hosts %}
+                <tr>
+                    <td><a href="/hosts/{{ row.host.id }}">{{ row.host.name }}</a></td>
+                    <td>{{ row.host.address }}:{{ row.host.ssh_port }}</td>
+                    <td>{{ row.host.port_start }} - {{ row.host.port_end }}</td>
+                    <td>{{ row.defaults.cpu_limit_cores }} 核 / {{ row.defaults.memory_limit_gb }} GB / {{ row.defaults.workspace_limit_gb }} GB</td>
+                    <td>
+                        <div>{{ '在线' if row.summary.reachable else '离线' }}</div>
+                        <form class="confirm-ajax-form" method="post" action="/hosts/{{ row.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？这不会删除远端服务器本身，只会删除平台记录。">
+                            <button class="button tiny danger" type="submit">移除记录</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </article>
+
+    <article class="panel">
+        <div class="panel-head">
+            <div>
+                <p class="eyebrow">新增宿主机</p>
+                <h2>通过 SSH 接入服务器</h2>
+            </div>
+        </div>
+        <form class="form-grid confirm-ajax-form" method="post" action="/hosts" data-confirm-message="确认保存该宿主机并接入平台？">
+            <label><span class="required-mark">*</span>名称<input name="name" required></label>
+            <label><span class="required-mark">*</span>地址<input name="address" required placeholder="10.0.0.12"></label>
+            <label><span class="required-mark">*</span>SSH 端口<input name="ssh_port" type="number" value="22"></label>
+            <label><span class="required-mark">*</span>SSH 用户<input name="ssh_user" value="root"></label>
+            <label><span class="required-mark">*</span>认证方式
+                <select name="auth_type">
+                    {% for item in auth_types %}
+                    <option value="{{ item }}" {% if item == 'password' %}selected{% endif %}>{{ '密码' if item == 'password' else '私钥' }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>SSH 密码 <span class="optional-mark">按认证方式填写</span><input name="ssh_password" type="password"></label>
+            <label>SSH 私钥路径 <span class="optional-mark">按认证方式填写</span><input name="ssh_key_path" placeholder="/root/.ssh/id_rsa"></label>
+            <label><span class="required-mark">*</span>起始端口<input name="port_start" type="number" value="50000"></label>
+            <label><span class="required-mark">*</span>结束端口<input name="port_end" type="number" value="50050"></label>
+            <label><span class="required-mark">*</span>/workspace 根目录<input name="workspace_root" value="/workspace/tenants"></label>
+            <label><span class="required-mark">*</span>/mnt 共享路径<input name="shared_mnt_path" value="/mnt"></label>
+            <label><span class="required-mark">*</span>快照根目录<input name="snapshot_root" value="/mnt/docker_platform_snapshots"></label>
+            <label><span class="required-mark">*</span>保底 CPU<input name="reserve_cpu_cores" type="number" step="1" value="8"></label>
+            <label><span class="required-mark">*</span>保底内存(GB)<input name="reserve_memory_gb" type="number" step="1" value="64"></label>
+            <label><span class="required-mark">*</span>保底磁盘(GB)<input name="reserve_disk_gb" type="number" step="1" value="200"></label>
+            <label><span class="required-mark">*</span>默认共享人数<input name="default_user_share" type="number" value="10"></label>
+            <label><span class="required-mark">*</span>快照保留数
+                <select name="snapshot_keep_count">
+                    <option value="0">0 - 不自动备份</option>
+                    <option value="1">1</option>
+                    <option value="2" selected>2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="5">5</option>
+                    <option value="6">6</option>
+                    <option value="8">8</option>
+                    <option value="10">10</option>
+                </select>
+            </label>
+            <label><span class="required-mark">*</span>快照周期(天)<input name="snapshot_interval_days" type="number" value="14"></label>
+            <label class="wide">备注 <span class="optional-mark">选填</span><textarea name="notes" rows="3"></textarea></label>
+            <button class="button" type="submit">保存宿主机</button>
+        </form>
+    </article>
+</section>
+{% endblock %}

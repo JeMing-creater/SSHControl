@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel auth-panel">
+    <div class="panel-head">
+        <div>
+            <p class="eyebrow">管理员登录</p>
+            <h2>进入控制平台</h2>
+        </div>
+    </div>
+    {% if request.query_params.get('error') %}
+    <section class="banner bad">{{ request.query_params.get('error') }}</section>
+    {% endif %}
+    {% if request.query_params.get('message') %}
+    <section class="banner">{{ request.query_params.get('message') }}</section>
+    {% endif %}
+    <form class="form-grid confirm-ajax-form" method="post" action="/login" data-confirm-message="确认登录控制平台？" data-success-redirect="/">
+        <label><span class="required-mark">*</span>账号<input name="account" required></label>
+        <label><span class="required-mark">*</span>密码<input name="password" type="password" required></label>
+        <div class="wide action-row">
+            <button class="button" type="submit">登录</button>
+            <a class="button secondary" href="/register">注册管理员账号</a>
+        </div>
+    </form>
+</section>
+{% endblock %}
