@@ -1,33 +1,68 @@
 # Control Platform
 
-集中管理多台 Docker 宿主机的端口容器分配平台。
+Docker 多宿主机分配与监控平台。
 
 ## 功能
 
-- 通过 SSH 管理平台本机和远端 Docker 宿主机
-- 按端口创建长期在线 SSH 容器
-- 记录使用者、用途、端口、镜像和资源配额
-- 默认共享宿主机 `/mnt`
-- CPU / 内存在线调整
-- 额外挂载变更提示“需要重建”
-- 自动环境快照归档到 `/mnt`
-- 可视化宿主机资源、容器配额和实时占用
-- 新建容器时自动补齐 X11-forwarding 所需的 `xauth` 与 `sshd` 配置
+- SSH 接入多台 Docker 宿主机
+- 按端口分配容器
+- 管理用户、管理员和使用者登录
+- 资源监控：CPU / 内存 / GPU 显存 / Docker 磁盘
+- 宿主机与容器的实时状态缓存
+- 快照、终端和批量维护
 
-## 运行
+## 运行环境
+
+- Python 3.11+
+- Conda base 环境可直接运行
+- 已安装 Docker 和 SSH 可达的宿主机
+
+## 快速开始
 
 ```bash
+cp .env.example .env
 conda activate base
-cd /workspace/Control
+pip install -r requirements.txt
 python run.py
 ```
 
-默认监听 `0.0.0.0:8080`。
+默认会从 `8080` 起寻找可用端口并启动服务。
 
-## 说明
+## 配置项
 
-- `/workspace` 存储上限当前以数据库记录和界面管理为主，尚未接入底层硬配额实现。
-- bind mount 变更会标记为“需重建”，由管理员确认重建后生效。
-- 环境快照采用 `docker commit + docker save` 方式归档，不包含用户代码/权重的专门备份逻辑。
-- X11-forwarding 当前假设基础镜像为 Ubuntu/Debian 系并可使用 `apt-get`；客户端仍需自备 X server，并通过 `ssh -X` 或 `ssh -Y` 连接。
-- 当前平台主路径为 SSH-only；即使管理平台所在服务器也应作为 SSH 宿主机接入，不再使用 local 直控策略。
+主要环境变量均以 `CONTROL_` 为前缀，见 [.env.example](./.env.example)。
+
+常用项：
+
+- `CONTROL_DATABASE_URL`：SQLite 或其他 SQLAlchemy 数据库连接串
+- `CONTROL_ROOT_ADMIN_ACCOUNT` / `CONTROL_ROOT_ADMIN_PASSWORD`：根管理员账号
+- `CONTROL_AUTH_SECRET_KEY`：登录会话签名密钥
+- `CONTROL_DEFAULT_WORKSPACE_ROOT`：宿主机工作目录
+- `CONTROL_DEFAULT_SNAPSHOT_ROOT`：快照目录
+- `CONTROL_BIND_PORT`：启动监听端口
+
+## 数据库
+
+默认使用 `data/platform.db`。
+
+- 首次启动会自动建表
+- `data/` 下的数据库文件不建议直接提交到 GitHub
+- 如需迁移到其他服务器，保留代码、`.env` 和宿主机接入配置即可
+
+## 部署注意
+
+- 宿主机必须能通过 SSH 登录，并可访问 Docker
+- `workspace_root` 需指向真实存在的目录
+- 若使用 SMTP 注册通知，请配置 `CONTROL_SMTP_*`
+- 平台支持长期运行，宿主机状态由后台定时刷新
+
+## 目录
+
+- `app/`：后端代码
+- `templates/`：Jinja2 页面
+- `static/`：样式和静态资源
+- `data/`：本地数据库
+
+## 许可证
+
+未指定。

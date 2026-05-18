@@ -12,13 +12,29 @@ from fastapi.templating import Jinja2Templates
 
 from app.config import get_settings
 from app.db import SessionLocal, init_db
-from app.models import Allocation
+from app.models import Allocation, ManagedHost
 from app.routes.web import router as web_router
-from app.services.auth import current_admin
+from app.services.auth import current_admin, current_platform_user
+from app.services.host_cache import schedule_host_refresh
 from app.services.snapshots import create_snapshot_record, snapshot_due
 
 
 settings = get_settings()
+
+
+async def host_monitor_scheduler(app: FastAPI) -> None:
+    while True:
+        db = SessionLocal()
+        try:
+            host_ids = [
+                item.id
+                for item in db.query(ManagedHost.id).filter(ManagedHost.enabled == True).all()  # noqa: E712
+            ]
+        finally:
+            db.close()
+        for host_id in host_ids:
+            schedule_host_refresh(host_id, full=False)
+        await asyncio.sleep(settings.host_monitor_interval_seconds)
 
 
 async def snapshot_scheduler(app: FastAPI) -> None:
@@ -44,13 +60,18 @@ async def lifespan(app: FastAPI):
     init_db()
     app.state.templates = Jinja2Templates(directory=str(settings.templates_dir))
     scheduler_task = asyncio.create_task(snapshot_scheduler(app))
+    monitor_task = asyncio.create_task(host_monitor_scheduler(app))
     app.state.scheduler_task = scheduler_task
+    app.state.monitor_task = monitor_task
     try:
         yield
     finally:
         scheduler_task.cancel()
+        monitor_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await scheduler_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
@@ -59,18 +80,21 @@ app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="stat
 
 @app.middleware("http")
 async def require_admin_login(request: Request, call_next):
-    public_paths = {"/login", "/register"}
+    public_paths = {"/login", "/register", "/user-login"}
     if request.url.path.startswith("/static") or request.url.path in public_paths:
         request.state.admin = None
+        request.state.platform_user = None
         return await call_next(request)
     db = SessionLocal()
     try:
         admin = current_admin(request, db)
+        platform_user = None if admin else current_platform_user(request, db)
     finally:
         db.close()
-    if not admin:
-        return RedirectResponse("/login", status_code=303)
+    if not admin and not platform_user:
+        return RedirectResponse("/user-login", status_code=303)
     request.state.admin = admin
+    request.state.platform_user = platform_user
     return await call_next(request)
 
 

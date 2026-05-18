@@ -69,7 +69,12 @@ class SSHRunner(BaseRunner):
             "hostname": self.host.address,
             "port": self.host.ssh_port,
             "username": self.host.ssh_user,
-            "timeout": timeout,
+            "timeout": min(timeout, 12),
+            "banner_timeout": min(timeout, 8),
+            "auth_timeout": min(timeout, 8),
+            "look_for_keys": False,
+            "allow_agent": False,
+            "compress": True,
         }
         if self.host.auth_type == AuthType.PASSWORD.value:
             connect_kwargs["password"] = self.host.ssh_password
@@ -92,6 +97,76 @@ class SSHRunner(BaseRunner):
             ) from exc
         finally:
             client.close()
+
+    def open_shell(self, timeout: int = 30, width: int = 160, height: int = 48) -> tuple[paramiko.SSHClient, paramiko.Channel]:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        connect_kwargs = {
+            "hostname": self.host.address,
+            "port": self.host.ssh_port,
+            "username": self.host.ssh_user,
+            "timeout": min(timeout, 12),
+            "banner_timeout": min(timeout, 8),
+            "auth_timeout": min(timeout, 8),
+            "look_for_keys": False,
+            "allow_agent": False,
+            "compress": True,
+        }
+        if self.host.auth_type == AuthType.PASSWORD.value:
+            connect_kwargs["password"] = self.host.ssh_password
+        elif self.host.auth_type == AuthType.KEY.value:
+            connect_kwargs["key_filename"] = self.host.ssh_key_path
+
+        try:
+            client.connect(**connect_kwargs)
+            channel = client.invoke_shell(term="xterm", width=width, height=height)
+            channel.settimeout(timeout)
+            return client, channel
+        except Exception as exc:
+            client.close()
+            raise RunnerError(
+                f"SSH shell 连接失败：{exc}",
+                command="invoke_shell",
+            ) from exc
+
+    def open_command_shell(
+        self,
+        command: str,
+        timeout: int = 30,
+        width: int = 160,
+        height: int = 48,
+    ) -> tuple[paramiko.SSHClient, paramiko.Channel]:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        connect_kwargs = {
+            "hostname": self.host.address,
+            "port": self.host.ssh_port,
+            "username": self.host.ssh_user,
+            "timeout": min(timeout, 12),
+            "banner_timeout": min(timeout, 8),
+            "auth_timeout": min(timeout, 8),
+            "look_for_keys": False,
+            "allow_agent": False,
+            "compress": True,
+        }
+        if self.host.auth_type == AuthType.PASSWORD.value:
+            connect_kwargs["password"] = self.host.ssh_password
+        elif self.host.auth_type == AuthType.KEY.value:
+            connect_kwargs["key_filename"] = self.host.ssh_key_path
+
+        try:
+            client.connect(**connect_kwargs)
+            channel = client.get_transport().open_session()
+            channel.get_pty(term="xterm", width=width, height=height)
+            channel.settimeout(timeout)
+            channel.exec_command(command)
+            return client, channel
+        except Exception as exc:
+            client.close()
+            raise RunnerError(
+                f"SSH 命令 shell 连接失败：{exc}",
+                command=command,
+            ) from exc
 
 
 def get_runner(host: ManagedHost) -> BaseRunner:

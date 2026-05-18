@@ -74,6 +74,41 @@ class ManagedHost(TimestampMixin, Base):
         cascade="all, delete-orphan",
     )
 
+    status_cache: Mapped["HostStatusCache | None"] = relationship(
+        back_populates="host",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class HostStatusCache(TimestampMixin, Base):
+    __tablename__ = "host_status_cache"
+
+    host_id: Mapped[int] = mapped_column(ForeignKey("managed_hosts.id"), primary_key=True)
+    reachable: Mapped[bool] = mapped_column(Boolean, default=False)
+    docker_info_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gpus_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    container_rows_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stats_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gpu_detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    disk_usage_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    stable_reachable: Mapped[bool] = mapped_column(Boolean, default=False)
+    stable_docker_info_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stable_gpus_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stable_container_rows_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stable_stats_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stable_gpu_detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stable_disk_usage_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stable_error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stable_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    refresh_in_progress: Mapped[bool] = mapped_column(Boolean, default=False)
+    refresh_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    refresh_completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    host: Mapped["ManagedHost"] = relationship(back_populates="status_cache")
+
 
 class AdminUser(TimestampMixin, Base):
     __tablename__ = "admin_users"
@@ -87,6 +122,16 @@ class AdminUser(TimestampMixin, Base):
     approved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PlatformUser(TimestampMixin, Base):
+    __tablename__ = "platform_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    account: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Allocation(TimestampMixin, Base):

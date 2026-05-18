@@ -1,4 +1,5 @@
 import socket
+import os
 
 import uvicorn
 
@@ -16,6 +17,8 @@ def find_port(start_port: int = 8080, max_tries: int = 20) -> int:
 
 
 if __name__ == "__main__":
-    port = find_port(8080)
-    print(f"Starting on port {port}")
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
+    host = os.getenv("CONTROL_BIND_HOST", "0.0.0.0")
+    start_port = int(os.getenv("CONTROL_BIND_PORT", "8080"))
+    port = find_port(start_port)
+    print(f"Starting on {host}:{port}")
+    uvicorn.run("app.main:app", host=host, port=port, reload=False)

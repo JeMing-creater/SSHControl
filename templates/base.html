@@ -17,21 +17,30 @@
             <p class="eyebrow">Docker Multi-Host Control</p>
             <h1>{{ settings.app_name }}</h1>
         </div>
-        <nav class="topnav">
-            <a href="/">总览</a>
-            <a href="/hosts">宿主机</a>
-            {% if admin and admin.get('is_root') %}
-            <a href="/admins">管理员</a>
-            {% endif %}
-            {% if admin %}
-            <form method="post" action="/logout">
-                <button class="nav-button" type="submit">退出 {{ admin.get('account') }}</button>
-            </form>
-            {% else %}
-            <a href="/login">登录</a>
-            <a href="/register">注册</a>
-            {% endif %}
-        </nav>
+        <div class="topbar-right">
+            <nav class="topnav">
+                <a class="nav-chip" href="/">总览</a>
+                {% if admin %}
+                <a class="nav-chip" href="/hosts">宿主机</a>
+                {% endif %}
+                {% if admin and admin.get('is_root') %}
+                <a class="nav-chip" href="/admins">管理员</a>
+                {% endif %}
+                {% if admin %}
+                <form method="post" action="/logout">
+                    <button class="nav-chip nav-button" type="submit">退出 {{ admin.get('account') }}</button>
+                </form>
+                {% elif platform_user %}
+                <form method="post" action="/logout">
+                    <button class="nav-chip nav-button" type="submit">退出 {{ platform_user.get('account') }}</button>
+                </form>
+                {% else %}
+                <a class="nav-chip" href="/login">管理员登录</a>
+                <a class="nav-chip" href="/user-login">使用者登录</a>
+                {% endif %}
+            </nav>
+            <img class="topbar-logo" src="/static/img/scut-emblem.png" alt="华南理工大学校徽">
+        </div>
     </header>
     <main class="layout">
         {% block content %}{% endblock %}

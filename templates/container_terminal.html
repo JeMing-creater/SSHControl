@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero compact">
+    <div>
+        <p class="eyebrow">容器命令行</p>
+        <h2>{{ allocation.assignee }} / 端口 {{ allocation.host_port }}</h2>
+        <p class="muted">{{ host.name }} | {{ allocation.container_name }} | {{ allocation.image_name }}</p>
+    </div>
+    <div class="hero-actions">
+        <a class="button secondary" href="/hosts/{{ host.id }}">返回宿主机详情</a>
+    </div>
+</section>
+
+<section class="terminal-shell">
+    <div class="terminal-head">
+        <div>
+            <p class="eyebrow">交互窗口</p>
+            <h3>访问本人容器命令行</h3>
+        </div>
+        <div class="compute-overview-kpis">
+            <span><strong id="terminal-state">等待连接</strong></span>
+            <span>端口：<span>{{ allocation.host_port }}</span></span>
+        </div>
+    </div>
+    <div id="terminal-progress" class="terminal-progress">
+        <div class="progress-label" id="terminal-progress-label">正在建立容器终端...</div>
+        <div class="progress-bar">
+            <div class="progress-fill terminal-progress-fill" id="terminal-progress-fill"></div>
+        </div>
+    </div>
+    <div id="terminal-error" class="terminal-error hidden"></div>
+    <div id="terminal-error-actions" class="hero-actions hidden">
+        <a class="button secondary" href="/hosts/{{ host.id }}">返回宿主机详情</a>
+        <a class="button secondary" href="/">返回总览</a>
+    </div>
+    <div id="terminal-output" class="terminal-output hidden" aria-live="polite"></div>
+    <form id="terminal-form" class="terminal-input-row hidden">
+        <label class="terminal-prompt" for="terminal-command" id="terminal-prompt">container:{{ allocation.host_port }}$</label>
+        <input id="terminal-command" name="command" autocomplete="off" spellcheck="false" placeholder="输入命令后回车">
+        <button class="button" type="submit">执行</button>
+        <button class="button danger" type="button" id="terminal-stop-btn">终止容器 shell 并返回</button>
+    </form>
+    <p class="terminal-tip muted">此窗口只连接当前账号所属容器，不开放宿主机命令行。</p>
+</section>
+
+<script>
+(() => {
+    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socketUrl = `${wsProtocol}//${window.location.host}/ws/allocations/{{ allocation.id }}/terminal`;
+    const progressWrap = document.getElementById("terminal-progress");
+    const progressLabel = document.getElementById("terminal-progress-label");
+    const progressFill = document.getElementById("terminal-progress-fill");
+    const errorBox = document.getElementById("terminal-error");
+    const errorActions = document.getElementById("terminal-error-actions");
+    const output = document.getElementById("terminal-output");
+    const form = document.getElementById("terminal-form");
+    const input = document.getElementById("terminal-command");
+    const prompt = document.getElementById("terminal-prompt");
+    const state = document.getElementById("terminal-state");
+    const stopBtn = document.getElementById("terminal-stop-btn");
+    let ws = null;
+    let progress = 0;
+    let connected = false;
+    let progressTimer = null;
+
+    const scrollBottom = () => {
+        output.scrollTop = output.scrollHeight;
+    };
+
+    const append = (text, kind = "stdout") => {
+        const line = document.createElement("div");
+        line.className = `terminal-line ${kind}`;
+        line.textContent = text;
+        output.appendChild(line);
+        scrollBottom();
+    };
+
+    const showError = (title, logText) => {
+        errorBox.classList.remove("hidden");
+        errorActions.classList.remove("hidden");
+        errorBox.innerHTML = "";
+        const head = document.createElement("div");
+        head.className = "terminal-error-title";
+        head.textContent = title;
+        errorBox.appendChild(head);
+        if (logText) {
+            const pre = document.createElement("pre");
+            pre.className = "terminal-error-log";
+            pre.textContent = logText;
+            errorBox.appendChild(pre);
+        }
+    };
+
+    const startProgress = () => {
+        progressTimer = window.setInterval(() => {
+            progress = Math.min(progress + 4, 92);
+            progressFill.style.width = `${progress}%`;
+            if (!connected) {
+                progressLabel.textContent = progress < 45 ? "正在连接宿主机 SSH..." : "正在进入容器 shell...";
+            }
+        }, 240);
+    };
+
+    const showTerminal = (promptText) => {
+        progressWrap.classList.add("hidden");
+        output.classList.remove("hidden");
+        form.classList.remove("hidden");
+        state.textContent = "已连接";
+        if (promptText) {
+            prompt.textContent = promptText;
+        }
+        input.focus();
+    };
+
+    const connect = () => {
+        ws = new WebSocket(socketUrl);
+        startProgress();
+        ws.onopen = () => {
+            progressLabel.textContent = "请求已发送，等待容器终端就绪...";
+        };
+        ws.onmessage = (event) => {
+            const payload = JSON.parse(event.data);
+            if (payload.event === "progress") {
+                progressLabel.textContent = payload.message || progressLabel.textContent;
+                if (typeof payload.progress === "number") {
+                    progress = payload.progress;
+                    progressFill.style.width = `${progress}%`;
+                }
+                return;
+            }
+            if (payload.event === "ready" || payload.event === "fallback") {
+                connected = true;
+                progress = 100;
+                progressFill.style.width = "100%";
+                showTerminal(payload.prompt || prompt.textContent);
+                append(payload.message || "容器命令行已就绪。", "system");
+                if (payload.event === "fallback" && payload.error_log) {
+                    showError(payload.message || "兼容模式", payload.error_log);
+                }
+                return;
+            }
+            if (payload.event === "output") {
+                append(payload.data || "", payload.stream === "stderr" ? "stderr" : "stdout");
+                if (payload.stderr) {
+                    append(payload.stderr, "stderr");
+                }
+                return;
+            }
+            if (payload.event === "error") {
+                const logText = payload.error_log || payload.message || "连接失败。";
+                showError(payload.message || "连接失败。", logText);
+                append(payload.message || "连接失败。", "stderr");
+                append(logText, "stderr");
+                state.textContent = "失败";
+                progressWrap.classList.add("hidden");
+                output.classList.remove("hidden");
+                form.classList.add("hidden");
+            }
+        };
+        ws.onclose = () => {
+            if (progressTimer) {
+                clearInterval(progressTimer);
+            }
+            if (!connected) {
+                progressLabel.textContent = "容器 shell 连接失败，请返回后重试。";
+                state.textContent = "失败";
+                if (!errorBox.textContent) {
+                    showError("容器 shell 连接失败。", "请检查容器是否运行、宿主机 SSH 是否可用。");
+                }
+            }
+        };
+        ws.onerror = () => {
+            append("WebSocket 连接错误。", "stderr");
+        };
+    };
+
+    form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const value = input.value.trim();
+        if (!value || !ws || ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        append(`${prompt.textContent}${value}`, "command");
+        ws.send(value);
+        input.value = "";
+    });
+
+    stopBtn.addEventListener("click", () => {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            ws.close(1000, "user_exit");
+        }
+        window.location.href = "/hosts/{{ host.id }}";
+    });
+
+    window.addEventListener("beforeunload", () => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close(1000, "user_exit");
+        }
+    });
+
+    connect();
+})();
+</script>
+{% endblock %}

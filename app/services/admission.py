@@ -21,6 +21,7 @@ ACTIVE_STATUSES = (
 class AdmissionDecision:
     allowed: bool
     reasons: list[str]
+    warnings: list[str] | None = None
 
 
 def recommended_defaults(host: ManagedHost, docker_info: dict | None = None) -> dict[str, int]:
@@ -44,20 +45,26 @@ def check_allocation(
     host: ManagedHost,
     cpu_limit_cores: float,
     memory_limit_gb: float,
+    workspace_limit_gb: float,
     exclude_allocation_id: int | None = None,
 ) -> AdmissionDecision:
     docker_info = {}
     try:
-        docker_info = DockerService(host).docker_info()
+        docker_service = DockerService(host)
+        docker_info = docker_service.docker_info()
+        disk_info = docker_service.filesystem_usage_gb(host.workspace_root)
     except Exception:
+        disk_info = {}
         pass
 
     total_cpu = float(docker_info.get("NCPU") or 0)
     total_memory_gb = float(docker_info.get("MemTotal") or 0) / (1024**3)
+    total_disk_gb = float(disk_info.get("total_gb") or 0)
 
     query = db.query(
         func.coalesce(func.sum(Allocation.cpu_limit_cores), 0.0),
         func.coalesce(func.sum(Allocation.memory_limit_gb), 0.0),
+        func.coalesce(func.sum(Allocation.workspace_limit_gb), 0.0),
     ).filter(
         Allocation.host_id == host.id,
         Allocation.status.in_(ACTIVE_STATUSES),
@@ -65,9 +72,10 @@ def check_allocation(
     if exclude_allocation_id is not None:
         query = query.filter(Allocation.id != exclude_allocation_id)
 
-    allocated_cpu, allocated_memory = query.one()
+    allocated_cpu, allocated_memory, allocated_disk = query.one()
 
     reasons: list[str] = []
+    warnings: list[str] = []
     if total_cpu and (allocated_cpu + cpu_limit_cores + host.reserve_cpu_cores) > total_cpu:
         reasons.append(
             f"CPU超出安全水位：当前已分配 {allocated_cpu:.1f} 核，保底预留 {host.reserve_cpu_cores:.1f} 核。"
@@ -76,4 +84,13 @@ def check_allocation(
         reasons.append(
             f"内存超出安全水位：当前已分配 {allocated_memory:.1f} GB，保底预留 {host.reserve_memory_gb:.1f} GB。"
         )
-    return AdmissionDecision(allowed=not reasons, reasons=reasons)
+    if not total_disk_gb:
+        if (host.workspace_limit_mode or "metadata_only").strip().lower() == "strict_storage_opt":
+            reasons.append("无法读取宿主机工作目录磁盘容量，严格磁盘限额模式下暂不允许分配。")
+        else:
+            warnings.append("无法读取宿主机工作目录磁盘容量，已降级为仅记录 workspace 上限，不阻断容器创建。")
+    elif (allocated_disk + workspace_limit_gb + host.reserve_disk_gb) > total_disk_gb:
+        reasons.append(
+            f"磁盘超出安全水位：当前已分配 {allocated_disk:.1f} GB，保底预留 {host.reserve_disk_gb:.1f} GB。"
+        )
+    return AdmissionDecision(allowed=not reasons, reasons=reasons, warnings=warnings)

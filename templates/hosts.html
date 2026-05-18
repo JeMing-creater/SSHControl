@@ -1,51 +1,65 @@
 {% extends "base.html" %}
 
 {% block content %}
-<section class="split">
-    <article class="panel">
+<section class="hero compact">
+    <div>
+        <p class="eyebrow">宿主机管理</p>
+        <h2>受管宿主机与接入入口</h2>
+        <p class="muted">左侧查看现有宿主机，右侧接入新的 SSH 服务器。视觉风格与总览保持一致，强调蓝色层次和轻卡片结构。</p>
+    </div>
+    <div class="hero-actions">
+        <span class="tag muted-tag">共 {{ hosts|length }} 台</span>
+    </div>
+</section>
+
+<section class="split hosts-surface">
+    <article class="panel hosts-list-panel">
         <div class="panel-head">
             <div>
                 <p class="eyebrow">宿主机列表</p>
-                <h2>受管宿主机</h2>
+                <h3>受管宿主机</h3>
             </div>
         </div>
-        <table class="table">
-            <thead>
-                <tr>
-                    <th>名称</th>
-                    <th>地址</th>
-                    <th>端口池</th>
-                    <th>默认建议值</th>
-                    <th>状态</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for row in hosts %}
-                <tr>
-                    <td><a href="/hosts/{{ row.host.id }}">{{ row.host.name }}</a></td>
-                    <td>{{ row.host.address }}:{{ row.host.ssh_port }}</td>
-                    <td>{{ row.host.port_start }} - {{ row.host.port_end }}</td>
-                    <td>{{ row.defaults.cpu_limit_cores }} 核 / {{ row.defaults.memory_limit_gb }} GB / {{ row.defaults.workspace_limit_gb }} GB</td>
-                    <td>
-                        <div>{{ '在线' if row.summary.reachable else '离线' }}</div>
-                        <form class="confirm-ajax-form" method="post" action="/hosts/{{ row.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？这不会删除远端服务器本身，只会删除平台记录。">
-                            <button class="button tiny danger" type="submit">移除记录</button>
-                        </form>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+        <div class="host-list">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>名称</th>
+                        <th>地址</th>
+                        <th>端口池</th>
+                        <th>默认建议值</th>
+                        <th>状态</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in hosts %}
+                    <tr>
+                        <td><a class="host-link" href="/hosts/{{ row.host.id }}">{{ row.host.name }}</a></td>
+                        <td>{{ row.host.address }}:{{ row.host.ssh_port }}</td>
+                        <td>{{ row.host.port_start }} - {{ row.host.port_end }}</td>
+                        <td>{{ row.defaults.cpu_limit_cores }} 核 / {{ row.defaults.memory_limit_gb }} GB / {{ row.defaults.workspace_limit_gb }} GB</td>
+                        <td>
+                            <div>{{ '在线' if row.summary.reachable else '离线' }}</div>
+                            <div class="status-timestamp">最后状态更新时间：{{ row.last_status_at }}</div>
+                            <form class="confirm-ajax-form" method="post" action="/hosts/{{ row.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？这不会删除远端服务器本身，只会删除平台记录。">
+                                <button class="button tiny danger" type="submit">移除记录</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
     </article>
 
-    <article class="panel">
+    <article class="panel hosts-form-panel">
         <div class="panel-head">
             <div>
                 <p class="eyebrow">新增宿主机</p>
-                <h2>通过 SSH 接入服务器</h2>
+                <h3>通过 SSH 接入服务器</h3>
             </div>
         </div>
-        <form class="form-grid confirm-ajax-form" method="post" action="/hosts" data-confirm-message="确认保存该宿主机并接入平台？">
+        <form class="form-grid confirm-ajax-form host-form" method="post" action="/hosts" data-confirm-message="确认保存该宿主机并接入平台？">
             <label><span class="required-mark">*</span>名称<input name="name" required></label>
             <label><span class="required-mark">*</span>地址<input name="address" required placeholder="10.0.0.12"></label>
             <label><span class="required-mark">*</span>SSH 端口<input name="ssh_port" type="number" value="22"></label>
@@ -83,8 +97,37 @@
             </label>
             <label><span class="required-mark">*</span>快照周期(天)<input name="snapshot_interval_days" type="number" value="14"></label>
             <label class="wide">备注 <span class="optional-mark">选填</span><textarea name="notes" rows="3"></textarea></label>
-            <button class="button" type="submit">保存宿主机</button>
+            <div class="wide action-row">
+                <button class="button secondary" type="button" id="test-ssh">检测连接</button>
+                <button class="button" type="submit" id="submit-setup" disabled>保存宿主机</button>
+            </div>
         </form>
     </article>
+</section>
+
+<section class="panel hosts-preview-panel">
+    <div class="panel-head">
+        <div>
+            <p class="eyebrow">状态预览</p>
+            <h3>当前接入宿主机摘要</h3>
+        </div>
+    </div>
+    <div class="grid cards three">
+        {% for row in hosts %}
+        <article class="card host-preview-card">
+            <div class="card-head">
+                <div>
+                    <p class="eyebrow">{{ row.host.address }}</p>
+                    <h3>{{ row.host.name }}</h3>
+                </div>
+                <span class="status {{ 'ok' if row.summary.reachable else 'bad' }}">
+                    {{ '在线' if row.summary.reachable else '离线' }}
+                </span>
+            </div>
+            <p class="muted">端口池 {{ row.host.port_start }} - {{ row.host.port_end }}</p>
+            <p class="status-timestamp">最后状态更新时间：{{ row.last_status_at }}</p>
+        </article>
+        {% endfor %}
+    </div>
 </section>
 {% endblock %}

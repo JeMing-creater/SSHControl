@@ -228,6 +228,121 @@ class DockerService:
             }
         return usage_by_name
 
+    def supports_container_disk_quota(self, timeout: int = 120) -> bool:
+        try:
+            info = self.docker_info(timeout=timeout)
+        except RunnerError:
+            return False
+
+        driver = str(info.get("Driver") or info.get("StorageDriver") or "").strip().lower()
+        driver_status: dict[str, str] = {}
+        for item in info.get("DriverStatus") or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                driver_status[str(item[0]).strip().lower()] = str(item[1]).strip().lower()
+        backing_fs = driver_status.get("backing filesystem") or str(info.get("BackingFilesystem") or "").strip().lower()
+        if driver not in {"overlay2", "overlayfs"} or backing_fs != "xfs":
+            return False
+
+        root_dir = str(info.get("DockerRootDir") or "/var/lib/docker").strip() or "/var/lib/docker"
+        try:
+            result = self.runner.run(f"findmnt -no OPTIONS {shlex.quote(root_dir)}", timeout=min(timeout, 30))
+        except RunnerError:
+            return False
+        if not result.ok:
+            return False
+        options = {part.strip().lower() for part in (result.stdout or "").split(",") if part.strip()}
+        return bool({"pquota", "prjquota"} & options)
+
+    def container_storage_opt(self, allocation: Allocation, logs: list[str] | None = None) -> str | None:
+        limit = float(allocation.workspace_limit_gb or 0.0)
+        if limit <= 0:
+            return None
+
+        mode = (self.host.workspace_limit_mode or "metadata_only").strip().lower()
+        if mode == "metadata_only":
+            self._log(logs, "当前宿主机磁盘限额模式为 metadata_only，跳过 Docker writable-layer 限额。")
+            return None
+
+        supported = self.supports_container_disk_quota(timeout=60)
+        if supported:
+            return f"--storage-opt size={limit}g"
+
+        if mode == "strict_storage_opt":
+            raise RunnerError(
+                "当前宿主机不满足 Docker 容器磁盘限额条件（需要 overlay2 + xfs + pquota/prjquota）。",
+                command="docker run --storage-opt size=...",
+            )
+
+        self._log(logs, "当前宿主机不支持 Docker writable-layer 磁盘限额，已仅保留平台准入控制。")
+        return None
+
+    def filesystem_usage_gb(self, path: str | None = None, timeout: int = 120) -> dict[str, float | str]:
+        target = (path or self.host.workspace_root or "/").strip() or "/"
+        script = f"""
+set -u
+target={shlex.quote(target)}
+while [ ! -e "$target" ] && [ "$target" != "/" ]; do
+    target=$(dirname "$target")
+done
+df_bin=df
+if [ -x /usr/bin/df ]; then
+    df_bin=/usr/bin/df
+elif [ -x /bin/df ]; then
+    df_bin=/bin/df
+fi
+last_line() {{
+    line=
+    while IFS= read -r current; do
+        [ -n "$current" ] && line=$current
+    done
+    printf '%s\\n' "$line"
+}}
+if output=$(LC_ALL=C "$df_bin" -B1 --output=size,used,avail,target "$target" 2>/dev/null | last_line) && [ -n "$output" ]; then
+    printf 'bytes %s\\n' "$output"
+    exit 0
+fi
+if output=$(LC_ALL=C "$df_bin" -Pk "$target" 2>/dev/null | last_line) && [ -n "$output" ]; then
+    printf 'kbytes %s\\n' "$output"
+    exit 0
+fi
+if output=$(LC_ALL=C "$df_bin" -k "$target" 2>/dev/null | last_line) && [ -n "$output" ]; then
+    printf 'kbytes %s\\n' "$output"
+    exit 0
+fi
+exit 1
+"""
+        result = self.runner.run(f"sh -lc {shlex.quote(script)}", timeout=timeout)
+        if not result.ok or not result.stdout.strip():
+            return {}
+
+        parts = result.stdout.strip().split()
+        try:
+            mode = parts[0]
+            if mode == "bytes":
+                if len(parts) < 5:
+                    return {}
+                total_bytes = float(parts[1])
+                used_bytes = float(parts[2])
+                avail_bytes = float(parts[3])
+                mounted_on = " ".join(parts[4:])
+            elif mode == "kbytes":
+                if len(parts) < 6:
+                    return {}
+                total_bytes = float(parts[2]) * 1024
+                used_bytes = float(parts[3]) * 1024
+                avail_bytes = float(parts[4]) * 1024
+                mounted_on = " ".join(parts[6:]) if len(parts) > 6 else parts[-1]
+            else:
+                return {}
+        except (IndexError, ValueError):
+            return {}
+        return {
+            "total_gb": total_bytes / (1024**3),
+            "used_gb": used_bytes / (1024**3),
+            "avail_gb": avail_bytes / (1024**3),
+            "target": mounted_on,
+        }
+
     def list_images(self) -> list[str]:
         raw = self._run("docker images --format '{{.Repository}}:{{.Tag}}'")
         images: list[str] = []
@@ -637,6 +752,7 @@ fi
         if allocation.extra_mounts:
             for mount in parse_mounts(allocation.extra_mounts):
                 mounts.append(f"-v {mount}")
+        storage_opt = self.container_storage_opt(allocation, logs=logs)
 
         command_parts = [
             "docker run -d --restart unless-stopped",
@@ -644,6 +760,7 @@ fi
             f"-p {allocation.host_port}:22",
             f"--cpus {allocation.cpu_limit_cores}",
             f"--memory {allocation.memory_limit_gb}g",
+            storage_opt or "",
             "--gpus all" if allocation.all_gpus_visible else "",
             f"-e PASSWORD={shlex.quote(allocation.root_password)}",
             *mounts,
@@ -669,7 +786,7 @@ fi
         )
         self._run_with_retries(command, logs=logs, retries=1)
 
-    def stop_container(self, allocation: Allocation, logs: list[str] | None = None) -> None:
+    def stop_container(self, allocation: Allocation) -> None:
         command = f"docker stop {shlex.quote(allocation.container_name)}"
         result = self.runner.run(command, timeout=600)
         if not result.ok:
@@ -689,7 +806,7 @@ fi
             )
         allocation.status = AllocationStatus.STOPPED.value
 
-    def stop_container_by_name(self, container_name: str, logs: list[str] | None = None) -> str:
+    def stop_container_by_name(self, container_name: str) -> str:
         command = f"docker stop {shlex.quote(container_name)}"
         result = self.runner.run(command, timeout=600)
         if not result.ok:
@@ -707,7 +824,7 @@ fi
             )
         return AllocationStatus.STOPPED.value
 
-    def start_container(self, allocation: Allocation, logs: list[str] | None = None) -> None:
+    def start_container(self, allocation: Allocation) -> None:
         command = f"docker start {shlex.quote(allocation.container_name)}"
         result = self.runner.run(command, timeout=600)
         if not result.ok:
@@ -741,7 +858,7 @@ fi
             raise
         allocation.status = AllocationStatus.RUNNING.value
 
-    def start_container_by_name(self, container_name: str, logs: list[str] | None = None) -> str:
+    def start_container_by_name(self, container_name: str) -> str:
         command = f"docker start {shlex.quote(container_name)}"
         result = self.runner.run(command, timeout=600)
         if not result.ok:
@@ -783,11 +900,11 @@ fi
         self._log(logs, f"容器 {container_name} 已重启")
         return AllocationStatus.RUNNING.value
 
-    def remove_container(self, allocation: Allocation, logs: list[str] | None = None) -> None:
+    def remove_container(self, allocation: Allocation) -> None:
         self.ensure_container_absent(allocation.container_name)
         allocation.status = AllocationStatus.DELETED.value
 
-    def remove_container_by_name(self, container_name: str, logs: list[str] | None = None) -> str:
+    def remove_container_by_name(self, container_name: str) -> str:
         self.ensure_container_absent(container_name)
         return AllocationStatus.DELETED.value
 
@@ -838,4 +955,4 @@ fi
 
     def restore_snapshot(self, allocation: Allocation, archive_path: str, image_ref: str, logs: list[str] | None = None) -> None:
         self._run_with_retries(f"docker load -i {shlex.quote(archive_path)}", timeout=3600, logs=logs, retries=1)
-        self.rebuild_container(allocation, image_ref=image_ref, logs=logs)
+        self.rebuild_container(allocation, image_name=image_ref, logs=logs)

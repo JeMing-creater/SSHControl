@@ -12,10 +12,11 @@ from fastapi import Request
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import AdminStatus, AdminUser
+from app.models import AdminStatus, AdminUser, Allocation, AllocationStatus, PlatformUser
 
 
 SESSION_COOKIE = "control_admin_session"
+USER_SESSION_COOKIE = "control_user_session"
 SESSION_MAX_AGE_SECONDS = 5 * 24 * 60 * 60
 
 
@@ -84,6 +85,93 @@ def current_admin(request: Request, db: Session) -> dict | None:
     if user and user.status == AdminStatus.APPROVED.value:
         return {"account": user.account, "is_root": False, "user": user}
     return None
+
+
+def current_platform_user(request: Request, db: Session) -> dict | None:
+    account = read_session(request.cookies.get(USER_SESSION_COOKIE), client_ip(request))
+    if not account:
+        return None
+    explicit_user = (
+        db.query(PlatformUser)
+        .filter(
+            PlatformUser.account == account,
+            PlatformUser.enabled.is_(True),
+        )
+        .first()
+    )
+    allocations = (
+        db.query(Allocation)
+        .filter(
+            Allocation.assignee == account,
+            Allocation.status != AllocationStatus.DELETED.value,
+        )
+        .all()
+    )
+    if not explicit_user and not allocations:
+        return None
+    host_ids = sorted({allocation.host_id for allocation in allocations})
+    return {
+        "account": account,
+        "is_user": True,
+        "is_public_user": bool(explicit_user and not allocations),
+        "allocation_ids": [allocation.id for allocation in allocations],
+        "host_ids": host_ids,
+    }
+
+
+def authenticate_platform_user(db: Session, account: str, password: str) -> dict | None:
+    normalized_account = account.strip()
+    explicit_user = (
+        db.query(PlatformUser)
+        .filter(
+            PlatformUser.account == normalized_account,
+            PlatformUser.enabled.is_(True),
+        )
+        .first()
+    )
+    if explicit_user and verify_password(password, explicit_user.password_hash):
+        allocations = (
+            db.query(Allocation)
+            .filter(
+                Allocation.assignee == normalized_account,
+                Allocation.status != AllocationStatus.DELETED.value,
+            )
+            .all()
+        )
+        return {
+            "account": normalized_account,
+            "is_user": True,
+            "is_public_user": not bool(allocations),
+            "allocation_ids": [item.id for item in allocations],
+            "host_ids": sorted({item.host_id for item in allocations}),
+        }
+
+    allocation = (
+        db.query(Allocation)
+        .filter(
+            Allocation.assignee == normalized_account,
+            Allocation.root_password == password,
+            Allocation.status != AllocationStatus.DELETED.value,
+        )
+        .first()
+    )
+    if not allocation:
+        return None
+    allocations = (
+        db.query(Allocation)
+        .filter(
+            Allocation.assignee == normalized_account,
+            Allocation.status != AllocationStatus.DELETED.value,
+        )
+        .all()
+    )
+    return {
+        "account": normalized_account,
+        "is_user": True,
+        "is_public_user": False,
+        "allocation_ids": [item.id for item in allocations],
+        "host_ids": sorted({item.host_id for item in allocations}),
+    }
 
 
 def send_registration_email(user: AdminUser) -> str:

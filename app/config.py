@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     default_base_image: str = "pytorch:2.7.1-cuda12.8-cudnn9-devel"
     default_user_share: int = 10
     scheduler_interval_seconds: int = 3600
+    host_monitor_interval_seconds: int = 900
     dashboard_refresh_seconds: int = 30
     auth_secret_key: str = "change-this-control-platform-secret"
     root_admin_account: str = "root"

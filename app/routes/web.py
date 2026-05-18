@@ -1,27 +1,34 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import shlex
+from zoneinfo import ZoneInfo
 from datetime import datetime
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import AdminStatus, AdminUser, Allocation, AllocationStatus, AuthType, ManagedHost, SnapshotRecord
+from app.models import AdminStatus, AdminUser, Allocation, AllocationStatus, AuthType, HostStatusCache, ManagedHost, SnapshotRecord
 from app.services.admission import check_allocation, recommended_defaults
 from app.services.docker_engine import DockerService, slugify
-from app.services.metrics import host_summary, parse_memory_usage, parse_percent
+from app.services.host_cache import schedule_host_refresh
+from app.services.metrics import parse_memory_usage, parse_percent
 from app.services.snapshots import create_snapshot_record, effective_snapshot_policy
-from app.services.ssh_client import RunnerError
+from app.services.ssh_client import RunnerError, get_runner
 from app.services.auth import (
     SESSION_COOKIE,
     SESSION_MAX_AGE_SECONDS,
+    USER_SESSION_COOKIE,
+    authenticate_platform_user,
     client_ip,
-    current_admin,
     password_hash,
+    read_session,
     send_registration_email,
     sign_session,
     verify_password,
@@ -30,10 +37,14 @@ from app.services.auth import (
 
 router = APIRouter()
 settings = get_settings()
+beijing_tz = ZoneInfo("Asia/Shanghai")
+HOST_REFRESH_INTERVAL_SECONDS = 15 * 60
 
 
 def render(request: Request, template_name: str, context: dict):
     context.setdefault("admin", getattr(request.state, "admin", None))
+    context.setdefault("platform_user", getattr(request.state, "platform_user", None))
+    context.setdefault("is_user_view", bool(getattr(request.state, "platform_user", None)))
     return request.app.state.templates.TemplateResponse(
         request,
         template_name,
@@ -74,6 +85,53 @@ def wants_json(request: Request) -> bool:
     )
 
 
+def active_platform_user(request: Request) -> dict | None:
+    return getattr(request.state, "platform_user", None)
+
+
+def require_admin_response(request: Request, redirect_url: str = "/"):
+    if getattr(request.state, "admin", None):
+        return None
+    message = "当前账号无管理权限。"
+    if wants_json(request):
+        return JSONResponse(
+            {"ok": False, "message": message, "error_log": "普通使用者禁止执行维护和管理操作。"},
+            status_code=403,
+        )
+    return RedirectResponse(f"{redirect_url}?error={message}", status_code=303)
+
+
+def user_allocation_ids(db: Session, account: str) -> set[int]:
+    rows = (
+        db.query(Allocation.id)
+        .filter(
+            Allocation.assignee == account,
+            Allocation.status != AllocationStatus.DELETED.value,
+        )
+        .all()
+    )
+    return {int(row[0]) for row in rows}
+
+
+def allocation_owner_response(request: Request, allocation: Allocation):
+    platform_user = active_platform_user(request)
+    if not platform_user:
+        return None
+    if allocation.assignee == platform_user.get("account"):
+        return None
+    message = "当前账号不能访问该容器。"
+    if wants_json(request):
+        return JSONResponse({"ok": False, "message": message, "error_log": message}, status_code=403)
+    return RedirectResponse("/?error=当前账号不能访问该容器。", status_code=303)
+
+
+def websocket_client_ip(websocket: WebSocket) -> str:
+    forwarded = websocket.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return websocket.client.host if websocket.client else ""
+
+
 def log_response(lines: list[str], ok: bool = True, message: str = "", error_log: str = "", status_code: int = 200):
     payload = {"ok": ok, "message": message, "logs": lines}
     if error_log:
@@ -94,7 +152,378 @@ def ssh_host_count(db: Session) -> int:
     )
 
 
-def compute_visual_payload(db: Session) -> dict:
+def parse_cache_json(raw: str | None, fallback):
+    if not raw:
+        return fallback
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def host_cache_payload(host: ManagedHost, cache: HostStatusCache | None = None, stable: bool = True) -> dict:
+    cache = cache or host.status_cache
+    use_stable = bool(stable and cache and cache.stable_refreshed_at)
+    return {
+        "reachable": bool(cache.stable_reachable if use_stable else cache.reachable) if cache else False,
+        "docker_info": parse_cache_json(cache.stable_docker_info_json if use_stable else cache.docker_info_json, {}) if cache else {},
+        "container_rows": parse_cache_json(cache.stable_container_rows_json if use_stable else cache.container_rows_json, []) if cache else [],
+        "stats": parse_cache_json(cache.stable_stats_json if use_stable else cache.stats_json, []) if cache else [],
+        "gpus": parse_cache_json(cache.stable_gpus_json if use_stable else cache.gpus_json, []) if cache else [],
+        "gpu_detail_by_name": parse_cache_json(cache.stable_gpu_detail_json if use_stable else cache.gpu_detail_json, {}) if cache else {},
+        "disk_usage_by_name": parse_cache_json(cache.stable_disk_usage_json if use_stable else cache.disk_usage_json, {}) if cache else {},
+        "error_log": (cache.stable_error_log if use_stable else cache.error_log) if cache else "",
+        "refreshed_at": (cache.stable_refreshed_at if use_stable else cache.refreshed_at) if cache else None,
+        "dynamic_refreshed_at": cache.refreshed_at if cache else None,
+        "refresh_in_progress": bool(cache.refresh_in_progress) if cache else False,
+        "refresh_started_at": cache.refresh_started_at if cache else None,
+        "refresh_completed_at": cache.refresh_completed_at if cache else None,
+        "using_stable": use_stable,
+    }
+
+
+def cache_needs_full_refresh(host: ManagedHost, cached: dict, db: Session) -> bool:
+    if not cached["refreshed_at"]:
+        return True
+    if cached.get("refresh_in_progress"):
+        return False
+    allocations_exist = db.query(Allocation.id).filter(Allocation.host_id == host.id).first() is not None
+    if not allocations_exist:
+        return False
+    if not cached["container_rows"]:
+        return True
+    if not cached["gpus"]:
+        return True
+    if not cached["stats"] and allocations_exist:
+        return True
+    if not cached["gpu_detail_by_name"] or not cached["disk_usage_by_name"]:
+        return True
+    return False
+
+
+def format_cache_time(value: datetime | None) -> str:
+    if not value:
+        return "暂无缓存"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=ZoneInfo("UTC"))
+    return value.astimezone(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def active_host_allocations(db_allocations: list[Allocation]) -> list[Allocation]:
+    return [
+        allocation
+        for allocation in db_allocations
+        if allocation.status != AllocationStatus.DELETED.value
+    ]
+
+
+def host_port_pool_state(host: ManagedHost, db_allocations: list[Allocation], cached_container_rows: list[dict]) -> dict:
+    active_allocations = active_host_allocations(db_allocations)
+    deleted_container_names = {
+        allocation.container_name
+        for allocation in db_allocations
+        if allocation.status == AllocationStatus.DELETED.value and allocation.container_name
+    }
+    used_ports = {
+        int(allocation.host_port)
+        for allocation in active_allocations
+        if host.port_start <= int(allocation.host_port) <= host.port_end
+    }
+    for row in cached_container_rows:
+        container_name = str(row.get("container_name") or "")
+        if container_name in deleted_container_names:
+            continue
+        try:
+            host_port = int(row.get("host_port"))
+        except (TypeError, ValueError):
+            continue
+        if host.port_start <= host_port <= host.port_end:
+            used_ports.add(host_port)
+    available_ports = [
+        port
+        for port in range(host.port_start, host.port_end + 1)
+        if port not in used_ports
+    ]
+    return {
+        "used_ports": sorted(used_ports),
+        "available_ports": available_ports,
+    }
+
+
+def remove_cached_container_row(db: Session, host_id: int, container_name: str) -> bool:
+    target = container_name.strip().lstrip("/")
+    if not target:
+        return False
+    cache = db.query(HostStatusCache).filter(HostStatusCache.host_id == host_id).first()
+    if not cache:
+        return False
+
+    def matches_name(value: object) -> bool:
+        return str(value or "").strip().lstrip("/") == target
+
+    def prune_row_list(raw: str | None, name_keys: tuple[str, ...]) -> tuple[str | None, bool]:
+        rows = parse_cache_json(raw, [])
+        if not isinstance(rows, list):
+            return raw, False
+        next_rows = [
+            row
+            for row in rows
+            if not any(matches_name(row.get(key)) for key in name_keys if isinstance(row, dict))
+        ]
+        if len(next_rows) == len(rows):
+            return raw, False
+        return json.dumps(next_rows, ensure_ascii=False), True
+
+    def prune_mapping(raw: str | None) -> tuple[str | None, bool]:
+        mapping = parse_cache_json(raw, {})
+        if not isinstance(mapping, dict):
+            return raw, False
+        next_mapping = {
+            key: value
+            for key, value in mapping.items()
+            if not matches_name(key)
+        }
+        if len(next_mapping) == len(mapping):
+            return raw, False
+        return json.dumps(next_mapping, ensure_ascii=False), True
+
+    changed = False
+    for attr, keys in (
+        ("container_rows_json", ("container_name", "Name")),
+        ("stable_container_rows_json", ("container_name", "Name")),
+        ("stats_json", ("Name", "container_name")),
+        ("stable_stats_json", ("Name", "container_name")),
+    ):
+        next_value, attr_changed = prune_row_list(getattr(cache, attr), keys)
+        if attr_changed:
+            setattr(cache, attr, next_value)
+            changed = True
+    for attr in (
+        "gpu_detail_json",
+        "stable_gpu_detail_json",
+        "disk_usage_json",
+        "stable_disk_usage_json",
+    ):
+        next_value, attr_changed = prune_mapping(getattr(cache, attr))
+        if attr_changed:
+            setattr(cache, attr, next_value)
+            changed = True
+    if changed:
+        cache.updated_at = datetime.utcnow()
+    return changed
+
+
+def upsert_cached_container_row(
+    db: Session,
+    host_id: int,
+    container_name: str,
+    host_port: int,
+    image_name: str,
+    status: str,
+) -> bool:
+    name = container_name.strip().lstrip("/")
+    if not name:
+        return False
+    cache = db.query(HostStatusCache).filter(HostStatusCache.host_id == host_id).first()
+    if not cache:
+        cache = HostStatusCache(host_id=host_id)
+        db.add(cache)
+
+    next_row = {
+        "container_name": name,
+        "host_port": int(host_port),
+        "status": status,
+        "image_name": image_name,
+        "cache_pending": True,
+    }
+
+    def merge_rows(raw: str | None) -> tuple[str, bool]:
+        rows = parse_cache_json(raw, [])
+        if not isinstance(rows, list):
+            rows = []
+        changed = False
+        merged = []
+        found = False
+        for row in rows:
+            if not isinstance(row, dict):
+                merged.append(row)
+                continue
+            row_name = str(row.get("container_name") or row.get("Name") or "").strip().lstrip("/")
+            row_port = row.get("host_port")
+            try:
+                row_port = int(row_port)
+            except (TypeError, ValueError):
+                row_port = None
+            if row_name == name or row_port == int(host_port):
+                current = {**row, **next_row}
+                merged.append(current)
+                found = True
+                changed = True
+            else:
+                merged.append(row)
+        if not found:
+            merged.append(next_row)
+            changed = True
+        return json.dumps(merged, ensure_ascii=False), changed
+
+    changed = False
+    for attr in ("container_rows_json", "stable_container_rows_json"):
+        next_value, attr_changed = merge_rows(getattr(cache, attr))
+        if attr_changed:
+            setattr(cache, attr, next_value)
+            changed = True
+    if changed:
+        now = datetime.utcnow()
+        cache.reachable = True
+        cache.stable_reachable = True
+        cache.updated_at = now
+        cache.refreshed_at = cache.refreshed_at or now
+        cache.stable_refreshed_at = cache.stable_refreshed_at or now
+    return changed
+
+
+def build_host_rows_from_cached_data(host: ManagedHost, db_allocations: list[Allocation], cached: dict) -> dict:
+    container_rows = cached["container_rows"]
+    stats_by_name = {item.get("Name"): item for item in cached["stats"]}
+    active_allocations = active_host_allocations(db_allocations)
+    deleted_container_names = {
+        allocation.container_name
+        for allocation in db_allocations
+        if allocation.status == AllocationStatus.DELETED.value and allocation.container_name
+    }
+    allocation_by_container_name = {
+        allocation.container_name: allocation for allocation in active_allocations
+    }
+    allocation_by_host_port = {
+        allocation.host_port: allocation for allocation in active_allocations
+    }
+    gpu_detail_by_name = cached["gpu_detail_by_name"]
+    disk_usage_by_name = cached["disk_usage_by_name"]
+    allocation_rows = []
+    unified_container_rows = []
+    resource_chart_rows = []
+    rendered_allocation_ids: set[int] = set()
+
+    def append_resource_row(row: dict, allocation: Allocation | None) -> None:
+        resource_chart_rows.append(
+            {
+                "port": row["host_port"],
+                "assignee": row["assignee"],
+                "status": row["status"],
+                "cpu_percent": round(float(row.get("cpu_percent") or 0.0), 2),
+                "memory_used_gb": round(float(row.get("memory_used_gb") or 0.0), 2),
+                "gpu_memory_used_mb": round(float(row.get("gpu_memory_used_mb") or 0.0), 2),
+                "gpu_memory_detail": row.get("gpu_memory_detail") or [],
+                "disk_used_gb": round(float(row.get("disk_used_gb") or 0.0), 2),
+                "disk_virtual_gb": round(float(row.get("disk_virtual_gb") or 0.0), 2),
+                "cpu_limit_cores": round(float(allocation.cpu_limit_cores or 0.0), 2) if allocation else 0.0,
+                "memory_limit_gb": round(float(allocation.memory_limit_gb or 0.0), 2) if allocation else 0.0,
+                "workspace_limit_gb": round(float(allocation.workspace_limit_gb or 0.0), 2) if allocation else 0.0,
+            }
+        )
+
+    for container_row in container_rows:
+        if str(container_row.get("container_name") or "") in deleted_container_names:
+            continue
+        allocation = allocation_by_container_name.get(
+            container_row["container_name"]
+        ) or allocation_by_host_port.get(container_row["host_port"])
+        stats = stats_by_name.get(container_row["container_name"], {})
+        cpu_percent = parse_percent(stats.get("CPUPerc", ""))
+        memory_used_gb = parse_memory_usage(stats.get("MemUsage", ""))
+        gpu_memory_detail = gpu_detail_by_name.get(container_row["container_name"], [])
+        gpu_memory_used_mb = sum(float(item.get("used_memory_mb") or 0.0) for item in gpu_memory_detail)
+        disk_usage = disk_usage_by_name.get(container_row["container_name"], {})
+        disk_used_gb = float(disk_usage.get("disk_used_gb") or 0.0)
+        disk_virtual_gb = float(disk_usage.get("disk_virtual_gb") or 0.0)
+        disk_size_text = str(disk_usage.get("disk_size_text") or "")
+
+        if allocation:
+            snapshot_keep_count, snapshot_interval_days = effective_snapshot_policy(allocation)
+            allocation.status = container_row["status"]
+            allocation.image_name = container_row["image_name"] or allocation.image_name
+            row = {
+                "registered": True,
+                "allocation": allocation,
+                "container_name": allocation.container_name,
+                "host_port": allocation.host_port,
+                "assignee": allocation.assignee,
+                "purpose": allocation.purpose,
+                "image_name": allocation.image_name,
+                "status": allocation.status,
+                "stats": stats,
+                "cpu_percent": cpu_percent,
+                "memory_used_gb": memory_used_gb,
+                "gpu_memory_used_mb": gpu_memory_used_mb,
+                "gpu_memory_detail": gpu_memory_detail,
+                "disk_used_gb": disk_used_gb,
+                "disk_virtual_gb": disk_virtual_gb,
+                "disk_size_text": disk_size_text,
+                "effective_snapshot_keep_count": snapshot_keep_count,
+                "effective_snapshot_interval_days": snapshot_interval_days,
+            }
+            allocation_rows.append(row)
+            rendered_allocation_ids.add(allocation.id)
+        else:
+            row = {
+                "registered": False,
+                "container_name": container_row["container_name"],
+                "host_port": container_row["host_port"],
+                "assignee": container_row["container_name"],
+                "purpose": "原始设定",
+                "status": container_row["status"],
+                "image_name": container_row["image_name"],
+                "cpu_percent": cpu_percent,
+                "memory_used_gb": memory_used_gb,
+                "gpu_memory_used_mb": gpu_memory_used_mb,
+                "gpu_memory_detail": gpu_memory_detail,
+                "disk_used_gb": disk_used_gb,
+                "disk_virtual_gb": disk_virtual_gb,
+                "disk_size_text": disk_size_text,
+                "allocation": None,
+                "stats": stats,
+                "effective_snapshot_keep_count": host.snapshot_keep_count,
+                "effective_snapshot_interval_days": host.snapshot_interval_days,
+            }
+        unified_container_rows.append(row)
+        append_resource_row(row, allocation)
+
+    for allocation in active_allocations:
+        if allocation.id in rendered_allocation_ids:
+            continue
+        snapshot_keep_count, snapshot_interval_days = effective_snapshot_policy(allocation)
+        row = {
+            "registered": True,
+            "allocation": allocation,
+            "container_name": allocation.container_name,
+            "host_port": allocation.host_port,
+            "assignee": allocation.assignee,
+            "purpose": allocation.purpose,
+            "image_name": allocation.image_name,
+            "status": allocation.status,
+            "stats": {},
+            "cpu_percent": 0.0,
+            "memory_used_gb": 0.0,
+            "gpu_memory_used_mb": 0.0,
+            "gpu_memory_detail": [],
+            "disk_used_gb": 0.0,
+            "disk_virtual_gb": 0.0,
+            "disk_size_text": "",
+            "effective_snapshot_keep_count": snapshot_keep_count,
+            "effective_snapshot_interval_days": snapshot_interval_days,
+            "cache_pending": True,
+        }
+        allocation_rows.append(row)
+        unified_container_rows.append(row)
+        append_resource_row(row, allocation)
+    return {
+        "allocation_rows": allocation_rows,
+        "unified_container_rows": sorted(unified_container_rows, key=lambda row: row["host_port"]),
+        "resource_chart_rows": resource_chart_rows,
+    }
+
+
+def compute_visual_payload(db: Session, allowed_host_ids: set[int] | None = None) -> dict:
     hosts = db.query(ManagedHost).filter(ManagedHost.enabled == True).order_by(ManagedHost.name.asc()).all()  # noqa: E712
     rows = []
     total_gpu_used_mb = 0.0
@@ -118,11 +547,8 @@ def compute_visual_payload(db: Session) -> dict:
         running_count = sum(1 for allocation in active_allocations if allocation.status == AllocationStatus.RUNNING.value)
         container_count = len(active_allocations)
         total_containers += container_count
-        gpus = []
-        try:
-            gpus = DockerService(host).gpu_stats(timeout=5)
-        except Exception:
-            gpus = []
+        cached = host_cache_payload(host)
+        gpus = cached["gpus"]
         gpu_used_mb = sum(float(gpu.get("memory_used_mb") or 0.0) for gpu in gpus)
         gpu_total_mb = sum(float(gpu.get("memory_total_mb") or 0.0) for gpu in gpus)
         gpu_percent = (gpu_used_mb / gpu_total_mb * 100) if gpu_total_mb else 0.0
@@ -133,9 +559,11 @@ def compute_visual_payload(db: Session) -> dict:
                 "id": host.id,
                 "name": host.name,
                 "address": host.address,
+                "allowed": True,
                 "container_count": container_count,
                 "running_count": running_count,
                 "gpu_count": len(gpus),
+                "last_status_at": format_cache_time(cached["refreshed_at"]),
                 "gpu_used_mb": round(gpu_used_mb, 2),
                 "gpu_total_mb": round(gpu_total_mb, 2),
                 "gpu_percent": round(gpu_percent, 2),
@@ -188,7 +616,6 @@ def build_ssh_host(
         auth_type=resolved_auth_type,
         ssh_password=ssh_password or None,
         ssh_key_path=ssh_key_path or None,
-        is_local=False,
         port_start=port_start,
         port_end=port_end,
         workspace_root=workspace_root,
@@ -207,12 +634,14 @@ def build_ssh_host(
 def validate_ssh_docker(host: ManagedHost) -> dict:
     docker = DockerService(host)
     docker_info = docker.docker_info()
+    disk_info = docker.filesystem_usage_gb(host.workspace_root)
     used_ports = docker.used_host_ports()
     available_ports = [
         port for port in range(host.port_start, host.port_end + 1) if port not in used_ports
     ]
     return {
         "docker_info": docker_info,
+        "disk_info": disk_info,
         "used_ports": sorted(used_ports),
         "available_ports": available_ports,
     }
@@ -293,10 +722,61 @@ def login(request: Request, account: str = Form(...), password: str = Form(...))
         db.close()
 
 
+@router.get("/user-login")
+def user_login_page(request: Request):
+    db: Session = SessionLocal()
+    try:
+        return render(
+            request,
+            "user_login.html",
+            {
+                "settings": settings,
+                "message": "",
+                "visual": compute_visual_payload(db),
+            },
+        )
+    finally:
+        db.close()
+
+
+@router.post("/user-login")
+def user_login(request: Request, account: str = Form(...), password: str = Form(...)):
+    is_ajax = wants_json(request)
+    db: Session = SessionLocal()
+    try:
+        platform_user = authenticate_platform_user(db, account, password)
+        if not platform_user:
+            if is_ajax:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "message": "使用者账号或容器 SSH 密码错误，或该账号暂无有效分配。",
+                        "error_log": f"user login failed account={account}",
+                    },
+                    status_code=200,
+                )
+            return RedirectResponse("/user-login?error=使用者账号或容器 SSH 密码错误，或该账号暂无有效分配。", status_code=303)
+        response = RedirectResponse("/", status_code=303)
+        if is_ajax:
+            response = JSONResponse({"ok": True, "message": "使用者登录成功。", "redirect_url": "/"})
+        response.set_cookie(
+            USER_SESSION_COOKIE,
+            sign_session(platform_user["account"], client_ip(request)),
+            max_age=SESSION_MAX_AGE_SECONDS,
+            httponly=True,
+            samesite="lax",
+        )
+        response.delete_cookie(SESSION_COOKIE)
+        return response
+    finally:
+        db.close()
+
+
 @router.post("/logout")
 def logout():
-    response = RedirectResponse("/login", status_code=303)
+    response = RedirectResponse("/user-login", status_code=303)
     response.delete_cookie(SESSION_COOKIE)
+    response.delete_cookie(USER_SESSION_COOKIE)
     return response
 
 
@@ -386,13 +866,28 @@ def revoke_admin(request: Request, user_id: int):
 def dashboard(request: Request):
     db: Session = SessionLocal()
     try:
-        if ssh_host_count(db) == 0:
+        platform_user = active_platform_user(request)
+        if ssh_host_count(db) == 0 and not platform_user:
             return render_initial_setup(request)
         hosts = db.query(ManagedHost).order_by(ManagedHost.name.asc()).all()
-        allocations = db.query(Allocation).order_by(Allocation.created_at.desc()).limit(20).all()
+        allocations_query = db.query(Allocation).order_by(Allocation.created_at.desc())
+        if platform_user:
+            allocations_query = allocations_query.filter(Allocation.assignee == platform_user["account"])
+        allocations = allocations_query.limit(20).all()
         host_cards = []
         for host in hosts:
-            summary = host_summary(db, host, timeout=5, include_heavy=False, include_gpus=True)
+            cached = host_cache_payload(host)
+            rows_data = build_host_rows_from_cached_data(host, list(host.allocations), cached)
+            summary = {
+                "reachable": cached["reachable"],
+                "docker_info": cached["docker_info"],
+                "stats": cached["stats"],
+                "gpus": cached["gpus"],
+                "allocated_cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in rows_data["allocation_rows"]),
+                "allocated_memory_gb": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in rows_data["allocation_rows"]),
+                "active_allocations": sum(1 for row in rows_data["allocation_rows"] if row["status"] == AllocationStatus.RUNNING.value),
+                "container_count": len(cached["container_rows"]),
+            }
             total_cpu = float(summary["docker_info"].get("NCPU") or 0)
             total_memory_gb = float(summary["docker_info"].get("MemTotal") or 0) / (1024**3)
             host_cards.append(
@@ -401,6 +896,7 @@ def dashboard(request: Request):
                     "summary": summary,
                     "total_cpu": total_cpu,
                     "total_memory_gb": total_memory_gb,
+                    "last_status_at": format_cache_time(cached["refreshed_at"]),
                 }
             )
         return render(
@@ -418,7 +914,7 @@ def dashboard(request: Request):
 
 
 @router.get("/compute-visual/data")
-def compute_visual_data():
+def compute_visual_data(request: Request):
     db: Session = SessionLocal()
     try:
         return JSONResponse(compute_visual_payload(db))
@@ -428,6 +924,9 @@ def compute_visual_data():
 
 @router.get("/hosts")
 def hosts_page(request: Request):
+    admin_response = require_admin_response(request)
+    if admin_response:
+        return admin_response
     db: Session = SessionLocal()
     try:
         if ssh_host_count(db) == 0:
@@ -435,9 +934,20 @@ def hosts_page(request: Request):
         hosts = db.query(ManagedHost).order_by(ManagedHost.name.asc()).all()
         host_rows = []
         for host in hosts:
-            summary = host_summary(db, host, timeout=5, include_heavy=False, include_gpus=True)
+            cached = host_cache_payload(host)
+            rows_data = build_host_rows_from_cached_data(host, list(host.allocations), cached)
+            summary = {
+                "reachable": cached["reachable"],
+                "docker_info": cached["docker_info"],
+                "stats": cached["stats"],
+                "gpus": cached["gpus"],
+                "allocated_cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in rows_data["allocation_rows"]),
+                "allocated_memory_gb": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in rows_data["allocation_rows"]),
+                "active_allocations": sum(1 for row in rows_data["allocation_rows"] if row["status"] == AllocationStatus.RUNNING.value),
+                "container_count": len(cached["container_rows"]),
+            }
             defaults = recommended_defaults(host, summary["docker_info"])
-            host_rows.append({"host": host, "summary": summary, "defaults": defaults})
+            host_rows.append({"host": host, "summary": summary, "defaults": defaults, "last_status_at": format_cache_time(cached["refreshed_at"])})
         return render(
             request,
             "hosts.html",
@@ -461,7 +971,6 @@ def create_host(
     auth_type: str = Form(AuthType.PASSWORD.value),
     ssh_password: str = Form(""),
     ssh_key_path: str = Form(""),
-    is_local: bool = Form(False),
     port_start: int = Form(50000),
     port_end: int = Form(50050),
     workspace_root: str = Form("/workspace/tenants"),
@@ -475,6 +984,9 @@ def create_host(
     snapshot_interval_days: int = Form(14),
     notes: str = Form(""),
 ):
+    admin_response = require_admin_response(request, "/hosts")
+    if admin_response:
+        return admin_response
     is_ajax = wants_json(request)
     db: Session = SessionLocal()
     try:
@@ -530,6 +1042,7 @@ def create_host(
 
 @router.post("/setup/test")
 def test_initial_host(
+    request: Request,
     name: str = Form(...),
     address: str = Form(...),
     ssh_port: int = Form(22),
@@ -550,6 +1063,9 @@ def test_initial_host(
     snapshot_interval_days: int = Form(14),
     notes: str = Form(""),
 ):
+    admin_response = require_admin_response(request)
+    if admin_response:
+        return admin_response
     try:
         host = build_ssh_host(
             name=name,
@@ -617,6 +1133,9 @@ def create_initial_host(
     snapshot_interval_days: int = Form(14),
     notes: str = Form(""),
 ):
+    admin_response = require_admin_response(request)
+    if admin_response:
+        return admin_response
     is_ajax = wants_json(request)
     db: Session = SessionLocal()
     try:
@@ -678,6 +1197,9 @@ def update_host_snapshot_policy(
     snapshot_keep_count: int = Form(...),
     snapshot_interval_days: int = Form(...),
 ):
+    admin_response = require_admin_response(request, f"/hosts/{host_id}")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):
@@ -711,6 +1233,9 @@ def update_host_snapshot_policy(
 
 @router.post("/hosts/{host_id}/delete")
 def delete_host(request: Request, host_id: int):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):
@@ -756,198 +1281,85 @@ def delete_host(request: Request, host_id: int):
 def host_detail(request: Request, host_id: int):
     db: Session = SessionLocal()
     try:
+        platform_user = active_platform_user(request)
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
         if not host:
             return RedirectResponse("/hosts?error=未找到宿主机记录。", status_code=303)
-        try:
-            docker = DockerService(host)
-            reachable = docker.ping()
-        except RunnerError as exc:
-            docker = None
-            reachable = False
-            docker_error = str(exc)
-        else:
-            docker_error = ""
-        docker_info = docker.docker_info() if docker and reachable else {}
+        cached = host_cache_payload(host)
+        if (
+            not cached["refresh_in_progress"]
+            and (
+                not cached["refreshed_at"]
+                or (datetime.utcnow() - cached["refreshed_at"]).total_seconds() >= HOST_REFRESH_INTERVAL_SECONDS
+            )
+        ):
+            schedule_host_refresh(host.id, full=not bool(cached["refreshed_at"]))
         host_images = parse_cached_images(host.cached_images)
-        if not host_images and docker and reachable:
-            try:
-                host_images = docker.discover_images()
-            except RunnerError:
-                host_images = []
-            if host_images:
-                host.cached_images = json.dumps(host_images, ensure_ascii=False)
-                db.commit()
-        summary = {
-            "reachable": reachable,
-            "docker_info": docker_info,
-            "stats": [],
-            "gpus": docker.gpu_stats() if docker and reachable else [],
-            "allocated_cpu": 0.0,
-            "allocated_memory_gb": 0.0,
-            "active_allocations": 0,
-            "container_count": 0,
-        }
-        defaults = recommended_defaults(host, docker_info)
-        db_allocations = (
-            db.query(Allocation)
-            .filter(Allocation.host_id == host.id)
-            .order_by(Allocation.host_port.asc())
-            .all()
-        )
-        snapshots = (
-            db.query(SnapshotRecord)
-            .filter(SnapshotRecord.host_id == host.id)
-            .order_by(SnapshotRecord.created_at.desc())
-            .limit(20)
-            .all()
-        )
-        container_rows = (
-            docker.managed_container_rows(host.port_start, host.port_end)
-            if docker and reachable
-            else []
-        )
-        if not host_images and container_rows:
+        if not host_images and cached["container_rows"]:
             host_images = sorted(
                 {
                     (row.get("image_name") or "").strip()
-                    for row in container_rows
+                    for row in cached["container_rows"]
                     if (row.get("image_name") or "").strip()
                 }
             )
             if host_images:
                 host.cached_images = json.dumps(host_images, ensure_ascii=False)
                 db.commit()
-        stats_list = docker.list_container_stats() if docker and reachable else []
-        stats_by_name = {item.get("Name"): item for item in stats_list}
-        allocation_by_container_name = {
-            allocation.container_name: allocation for allocation in db_allocations
-        }
-        allocation_by_host_port = {
-            allocation.host_port: allocation for allocation in db_allocations
-        }
-        gpu_detail_by_name = docker.gpu_memory_detail_by_container() if docker and reachable else {}
-        disk_usage_by_name = docker.container_disk_usage_gb_map() if docker and reachable else {}
-        allocation_rows = []
-        unified_container_rows = []
-        resource_chart_rows = []
-        visible_ports = set()
-        for container_row in container_rows:
-            allocation = allocation_by_container_name.get(
-                container_row["container_name"]
-            ) or allocation_by_host_port.get(container_row["host_port"])
-            stats = stats_by_name.get(container_row["container_name"], {})
-            cpu_percent = parse_percent(stats.get("CPUPerc", ""))
-            memory_used_gb = parse_memory_usage(stats.get("MemUsage", ""))
-            gpu_memory_detail = gpu_detail_by_name.get(container_row["container_name"], [])
-            gpu_memory_used_mb = sum(float(item.get("used_memory_mb") or 0.0) for item in gpu_memory_detail)
-            disk_usage = disk_usage_by_name.get(container_row["container_name"], {})
-            disk_used_gb = float(disk_usage.get("disk_used_gb") or 0.0)
-            disk_virtual_gb = float(disk_usage.get("disk_virtual_gb") or 0.0)
-            disk_size_text = str(disk_usage.get("disk_size_text") or "")
-
-            if allocation:
-                visible_ports.add(allocation.host_port)
-                snapshot_keep_count, snapshot_interval_days = effective_snapshot_policy(allocation)
-                allocation.status = container_row["status"]
-                allocation.image_name = container_row["image_name"] or allocation.image_name
-                allocation_rows.append(
-                    {
-                        "registered": True,
-                        "allocation": allocation,
-                        "container_name": allocation.container_name,
-                        "host_port": allocation.host_port,
-                        "assignee": allocation.assignee,
-                        "purpose": allocation.purpose,
-                        "image_name": allocation.image_name,
-                        "status": allocation.status,
-                        "stats": stats,
-                        "cpu_percent": cpu_percent,
-                        "memory_used_gb": memory_used_gb,
-                        "gpu_memory_used_mb": gpu_memory_used_mb,
-                        "gpu_memory_detail": gpu_memory_detail,
-                        "disk_used_gb": disk_used_gb,
-                        "disk_virtual_gb": disk_virtual_gb,
-                        "disk_size_text": disk_size_text,
-                        "effective_snapshot_keep_count": snapshot_keep_count,
-                        "effective_snapshot_interval_days": snapshot_interval_days,
-                    }
-                )
-                unified_container_rows.append(allocation_rows[-1])
-                resource_chart_rows.append(
-                    {
-                        "port": allocation.host_port,
-                        "assignee": allocation.assignee,
-                        "status": allocation.status,
-                        "cpu_percent": round(cpu_percent, 2),
-                        "memory_used_gb": round(memory_used_gb, 2),
-                        "gpu_memory_used_mb": round(gpu_memory_used_mb, 2),
-                        "gpu_memory_detail": gpu_memory_detail,
-                        "disk_used_gb": round(disk_used_gb, 2),
-                        "disk_virtual_gb": round(disk_virtual_gb, 2),
-                        "cpu_limit_cores": round(float(allocation.cpu_limit_cores or 0.0), 2),
-                        "memory_limit_gb": round(float(allocation.memory_limit_gb or 0.0), 2),
-                        "workspace_limit_gb": round(float(allocation.workspace_limit_gb or 0.0), 2),
-                    }
-                )
-                continue
-
-            external_row = (
-                {
-                    "registered": False,
-                    "container_name": container_row["container_name"],
-                    "host_port": container_row["host_port"],
-                    "assignee": container_row["container_name"],
-                    "purpose": "原始设定",
-                    "status": container_row["status"],
-                    "image_name": container_row["image_name"],
-                    "cpu_percent": cpu_percent,
-                    "memory_used_gb": memory_used_gb,
-                    "gpu_memory_used_mb": gpu_memory_used_mb,
-                    "gpu_memory_detail": gpu_memory_detail,
-                    "disk_used_gb": disk_used_gb,
-                    "disk_virtual_gb": disk_virtual_gb,
-                    "disk_size_text": disk_size_text,
-                    "allocation": None,
-                    "stats": stats,
-                    "effective_snapshot_keep_count": host.snapshot_keep_count,
-                    "effective_snapshot_interval_days": host.snapshot_interval_days,
-                }
+        db_allocations = (
+            db.query(Allocation)
+            .filter(Allocation.host_id == host.id)
+            .order_by(Allocation.host_port.asc())
+            .all()
+        )
+        snapshots = []
+        if not platform_user:
+            snapshots = (
+                db.query(SnapshotRecord)
+                .filter(SnapshotRecord.host_id == host.id)
+                .order_by(SnapshotRecord.created_at.desc())
+                .limit(20)
+                .all()
             )
-            unified_container_rows.append(external_row)
-
-            resource_chart_rows.append(
-                {
-                    "port": container_row["host_port"],
-                    "assignee": container_row["container_name"],
-                    "status": container_row["status"],
-                    "cpu_percent": round(cpu_percent, 2),
-                    "memory_used_gb": round(memory_used_gb, 2),
-                    "gpu_memory_used_mb": round(gpu_memory_used_mb, 2),
-                    "gpu_memory_detail": gpu_memory_detail,
-                    "disk_used_gb": round(disk_used_gb, 2),
-                    "disk_virtual_gb": round(disk_virtual_gb, 2),
-                    "cpu_limit_cores": 0.0,
-                    "memory_limit_gb": 0.0,
-                    "workspace_limit_gb": 0.0,
-                }
+        rows_data = build_host_rows_from_cached_data(host, db_allocations, cached)
+        allocation_rows = rows_data["allocation_rows"]
+        unified_container_rows = rows_data["unified_container_rows"]
+        resource_chart_rows = rows_data["resource_chart_rows"]
+        owned_allocation_ids: set[int] = (
+            user_allocation_ids(db, platform_user["account"]) if platform_user else set()
+        )
+        user_has_host_allocation = bool(
+            platform_user
+            and any(
+                row["registered"] and row["allocation"].id in owned_allocation_ids
+                for row in unified_container_rows
             )
-        running_count = sum(1 for row in allocation_rows if row["allocation"].status == AllocationStatus.RUNNING.value)
-        summary["active_allocations"] = running_count
-        summary["container_count"] = len(container_rows)
-        summary["allocated_cpu"] = sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in allocation_rows)
-        summary["allocated_memory_gb"] = sum(float(row["allocation"].memory_limit_gb or 0.0) for row in allocation_rows)
-        used_ports = {row["host_port"] for row in container_rows}
-        available_ports = [
-            port for port in range(host.port_start, host.port_end + 1) if port not in used_ports
-        ]
+        )
+        owned_visible_container_count = sum(
+            1
+            for row in unified_container_rows
+            if row["registered"] and row["allocation"].id in owned_allocation_ids
+        )
+        summary = {
+            "reachable": cached["reachable"],
+            "docker_info": cached["docker_info"],
+            "stats": cached["stats"],
+            "gpus": cached["gpus"],
+            "allocated_cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in allocation_rows),
+            "allocated_memory_gb": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in allocation_rows),
+            "active_allocations": sum(1 for row in allocation_rows if row["status"] == AllocationStatus.RUNNING.value),
+            "container_count": len(cached["container_rows"]),
+        }
+        defaults = recommended_defaults(host, cached["docker_info"])
+        port_state = host_port_pool_state(host, db_allocations, cached["container_rows"])
+        used_ports = port_state["used_ports"]
+        available_ports = port_state["available_ports"]
         running_allocations = [
             row for row in allocation_rows if row["allocation"].status == AllocationStatus.RUNNING.value
         ]
         stopped_allocations = [
             row for row in allocation_rows if row["allocation"].status == AllocationStatus.STOPPED.value
         ]
-        unified_container_rows = sorted(unified_container_rows, key=lambda row: row["host_port"])
         return render(
             request,
             "host_detail.html",
@@ -961,20 +1373,457 @@ def host_detail(request: Request, host_id: int):
                 "running_allocations": running_allocations,
                 "stopped_allocations": stopped_allocations,
                 "available_ports": available_ports,
-                "used_ports": sorted(used_ports),
+                "used_ports": used_ports,
                 "snapshots": snapshots,
                 "base_image": settings.default_base_image,
                 "host_images": host_images,
                 "resource_chart_rows": resource_chart_rows,
-                "docker_error": docker_error,
+                "visual": compute_visual_payload(db),
+                "docker_error": "",
+                "last_status_at": format_cache_time(cached["refreshed_at"]),
+                "last_status_error": cached["error_log"] or "",
+                "refresh_in_progress": cached["refresh_in_progress"],
+                "refresh_started_at": format_cache_time(cached["refresh_started_at"]),
+                "owned_allocation_ids": sorted(owned_allocation_ids),
+                "owned_visible_container_count": owned_visible_container_count,
+                "user_has_host_allocation": user_has_host_allocation,
             },
         )
     finally:
         db.close()
 
 
+@router.get("/hosts/{host_id}/terminal")
+def host_terminal(request: Request, host_id: int):
+    admin_response = require_admin_response(request, f"/hosts/{host_id}")
+    if admin_response:
+        return admin_response
+    db: Session = SessionLocal()
+    try:
+        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        if not host:
+            return RedirectResponse("/hosts?error=未找到宿主机记录。", status_code=303)
+        cached = host_cache_payload(host)
+        if not cached["refreshed_at"] or (datetime.utcnow() - cached["refreshed_at"]).total_seconds() > 300:
+            schedule_host_refresh(host.id, full=cache_needs_full_refresh(host, cached, db))
+        return render(
+            request,
+            "host_terminal.html",
+            {
+                "settings": settings,
+                "host": host,
+                "reachable": cached["reachable"],
+                "last_status_at": format_cache_time(cached["refreshed_at"]),
+                "last_status_error": cached["error_log"] or "",
+            },
+        )
+    finally:
+        db.close()
+
+
+@router.post("/hosts/{host_id}/terminal/run")
+def host_terminal_run(
+    request: Request,
+    host_id: int,
+    command: str = Form(...),
+    timeout: int = Form(120),
+):
+    admin_response = require_admin_response(request, f"/hosts/{host_id}")
+    if admin_response:
+        return admin_response
+    db: Session = SessionLocal()
+    try:
+        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        if not host:
+            return JSONResponse({"ok": False, "message": "未找到宿主机记录。", "error_log": f"host_id={host_id}"}, status_code=404)
+        command_text = command.strip()
+        if not command_text:
+            return JSONResponse({"ok": False, "message": "请输入要执行的命令。", "error_log": ""}, status_code=200)
+        try:
+            runner = DockerService(host).runner
+        except Exception as exc:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "message": "SSH 连接不可用。",
+                    "error_log": str(exc),
+                },
+                status_code=200,
+            )
+        try:
+            result = runner.run(command_text, timeout=max(timeout, 10))
+            payload = {
+                "ok": result.ok,
+                "message": "命令执行完成。" if result.ok else "命令执行失败。",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.exit_code,
+            }
+            if not result.ok:
+                payload["error_log"] = result.stderr or result.stdout or f"exit_code={result.exit_code}"
+            return JSONResponse(payload, status_code=200)
+        except RunnerError as exc:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "message": "SSH 命令执行失败。",
+                    "error_log": exc.log_text() or str(exc),
+                },
+                status_code=200,
+            )
+    finally:
+        db.close()
+
+
+@router.websocket("/ws/hosts/{host_id}/terminal")
+async def host_terminal_ws(websocket: WebSocket, host_id: int):
+    db: Session = SessionLocal()
+    client = None
+    channel = None
+    fallback_mode = False
+    try:
+        await websocket.accept()
+        cookie_header = websocket.headers.get("cookie") or ""
+        cookies = {}
+        for chunk in cookie_header.split(";"):
+            if "=" in chunk:
+                key, value = chunk.split("=", 1)
+                cookies[key.strip()] = value.strip()
+        ip_address = websocket_client_ip(websocket)
+        account = read_session(cookies.get(SESSION_COOKIE), ip_address)
+        admin = None
+        if account:
+            if account == settings.root_admin_account:
+                admin = {"account": account, "is_root": True}
+            else:
+                admin_user = db.query(AdminUser).filter(AdminUser.account == account).first()
+                if admin_user and admin_user.status == AdminStatus.APPROVED.value:
+                    admin = {"account": account, "is_root": False}
+        if not admin:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": "当前账号无管理权限。",
+                    "error_log": "普通使用者禁止访问宿主机 SSH shell。",
+                }
+            )
+            await websocket.close()
+            return
+        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        if not host:
+            await websocket.send_json({"event": "error", "message": "未找到宿主机记录。", "error_log": f"host_id={host_id}"})
+            await websocket.close()
+            return
+        await websocket.send_json({"event": "progress", "message": "正在建立 SSH 连接...", "progress": 10})
+        try:
+            runner = get_runner(host)
+        except RunnerError as exc:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": "SSH 连接不可用。",
+                    "error_log": exc.log_text() or str(exc),
+                }
+            )
+            await websocket.close()
+            return
+        await websocket.send_json({"event": "progress", "message": "正在打开交互 shell...", "progress": 45})
+        try:
+            client, channel = await asyncio.to_thread(runner.open_shell, 30)
+        except RunnerError as exc:
+            fallback_mode = True
+            await websocket.send_json(
+                {
+                    "event": "fallback",
+                    "message": "SSH 交互 shell 不可用，已切换为 SSH 命令执行兼容模式。",
+                    "error_log": exc.log_text() or str(exc),
+                    "prompt": f"ssh@{host.name}$ ",
+                }
+            )
+        else:
+            await websocket.send_json({"event": "ready", "message": "SSH 命令行已连接。", "prompt": f"ssh@{host.name}$ "})
+
+        async def forward_stdout():
+            while True:
+                if fallback_mode or channel is None:
+                    break
+                try:
+                    if channel.recv_ready():
+                        data = channel.recv(4096)
+                        if data:
+                            await websocket.send_json({"event": "output", "stream": "stdout", "data": data.decode(errors="ignore")})
+                    if channel.recv_stderr_ready():
+                        data = channel.recv_stderr(4096)
+                        if data:
+                            await websocket.send_json({"event": "output", "stream": "stderr", "data": data.decode(errors="ignore")})
+                    if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                        break
+                except Exception as exc:
+                    await websocket.send_json({"event": "error", "message": "终端流读取失败。", "error_log": str(exc)})
+                    break
+                await asyncio.sleep(0.05)
+
+        forward_task = asyncio.create_task(forward_stdout())
+        try:
+            while True:
+                message = await websocket.receive_text()
+                if fallback_mode:
+                    if message.strip().lower() in {"exit", "logout"}:
+                        break
+                    result = await asyncio.to_thread(runner.run, message, 30)
+                    await websocket.send_json(
+                        {
+                            "event": "output",
+                            "stream": "stdout",
+                            "data": result.stdout,
+                            "stderr": result.stderr,
+                            "exit_code": result.exit_code,
+                        }
+                    )
+                    if result.stderr:
+                        await websocket.send_json(
+                            {
+                                "event": "output",
+                                "stream": "stderr",
+                                "data": result.stderr,
+                                "exit_code": result.exit_code,
+                            }
+                        )
+                    continue
+                if channel is None:
+                    continue
+                if message.strip().lower() in {"exit", "logout"}:
+                    channel.send("exit\n")
+                    break
+                channel.send(message + "\n")
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if forward_task:
+                forward_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await forward_task
+            await websocket.close()
+    finally:
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        db.close()
+
+
+@router.get("/allocations/{allocation_id}/terminal")
+def allocation_terminal(request: Request, allocation_id: int):
+    db: Session = SessionLocal()
+    try:
+        allocation = _require_allocation(db, allocation_id)
+        owner_response = allocation_owner_response(request, allocation)
+        if owner_response:
+            return owner_response
+        return render(
+            request,
+            "container_terminal.html",
+            {
+                "settings": settings,
+                "allocation": allocation,
+                "host": allocation.host,
+            },
+        )
+    except ValueError:
+        return RedirectResponse("/?error=未找到容器分配记录。", status_code=303)
+    finally:
+        db.close()
+
+
+@router.websocket("/ws/allocations/{allocation_id}/terminal")
+async def allocation_terminal_ws(websocket: WebSocket, allocation_id: int):
+    db: Session = SessionLocal()
+    client = None
+    channel = None
+    fallback_mode = False
+    runner = None
+    allocation = None
+    try:
+        await websocket.accept()
+        cookie_header = websocket.headers.get("cookie") or ""
+        cookies = {}
+        for chunk in cookie_header.split(";"):
+            if "=" in chunk:
+                key, value = chunk.split("=", 1)
+                cookies[key.strip()] = value.strip()
+        ip_address = websocket_client_ip(websocket)
+        admin_account = read_session(cookies.get(SESSION_COOKIE), ip_address)
+        user_account = read_session(cookies.get(USER_SESSION_COOKIE), ip_address)
+
+        allocation = db.query(Allocation).filter(Allocation.id == allocation_id).first()
+        if not allocation or allocation.status == AllocationStatus.DELETED.value:
+            await websocket.send_json({"event": "error", "message": "未找到有效容器分配记录。", "error_log": f"allocation_id={allocation_id}"})
+            await websocket.close()
+            return
+
+        admin_allowed = False
+        if admin_account:
+            if admin_account == settings.root_admin_account:
+                admin_allowed = True
+            else:
+                admin_user = db.query(AdminUser).filter(AdminUser.account == admin_account).first()
+                admin_allowed = bool(admin_user and admin_user.status == AdminStatus.APPROVED.value)
+        user_allowed = bool(user_account and allocation.assignee == user_account)
+        if not admin_allowed and not user_allowed:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": "当前账号不能访问该容器终端。",
+                    "error_log": "容器终端只允许管理员或该容器使用者访问。",
+                }
+            )
+            await websocket.close()
+            return
+
+        await websocket.send_json({"event": "progress", "message": "正在通过宿主机 SSH 建立容器终端...", "progress": 12})
+        try:
+            runner = get_runner(allocation.host)
+        except RunnerError as exc:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": "宿主机 SSH 连接不可用。",
+                    "error_log": exc.log_text() or str(exc),
+                }
+            )
+            await websocket.close()
+            return
+
+        await websocket.send_json({"event": "progress", "message": "正在检查容器状态...", "progress": 35})
+        try:
+            exists, runtime_status = await asyncio.to_thread(
+                DockerService(allocation.host).inspect_container_runtime,
+                allocation.container_name,
+            )
+        except RunnerError as exc:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": "容器状态检查失败。",
+                    "error_log": exc.log_text() or str(exc),
+                }
+            )
+            await websocket.close()
+            return
+        if not exists:
+            await websocket.send_json({"event": "error", "message": "容器不存在。", "error_log": allocation.container_name})
+            await websocket.close()
+            return
+        if runtime_status != "running":
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": "容器未运行，无法打开命令行。",
+                    "error_log": f"{allocation.container_name} status={runtime_status}",
+                }
+            )
+            await websocket.close()
+            return
+
+        shell_command = f"docker exec -it {shlex.quote(allocation.container_name)} bash"
+        fallback_prompt = f"container:{allocation.host_port}$ "
+        await websocket.send_json({"event": "progress", "message": "正在进入容器 shell...", "progress": 62})
+        try:
+            client, channel = await asyncio.to_thread(runner.open_command_shell, shell_command, 30)
+        except RunnerError as exc:
+            fallback_mode = True
+            await websocket.send_json(
+                {
+                    "event": "fallback",
+                    "message": "容器交互 shell 不可用，已切换为容器命令兼容模式。",
+                    "error_log": exc.log_text() or str(exc),
+                    "prompt": fallback_prompt,
+                }
+            )
+        else:
+            await websocket.send_json({"event": "ready", "message": "容器命令行已连接。", "prompt": fallback_prompt})
+
+        async def forward_stdout():
+            while True:
+                if fallback_mode or channel is None:
+                    break
+                try:
+                    if channel.recv_ready():
+                        data = channel.recv(4096)
+                        if data:
+                            await websocket.send_json({"event": "output", "stream": "stdout", "data": data.decode(errors="ignore")})
+                    if channel.recv_stderr_ready():
+                        data = channel.recv_stderr(4096)
+                        if data:
+                            await websocket.send_json({"event": "output", "stream": "stderr", "data": data.decode(errors="ignore")})
+                    if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                        break
+                except Exception as exc:
+                    await websocket.send_json({"event": "error", "message": "容器终端流读取失败。", "error_log": str(exc)})
+                    break
+                await asyncio.sleep(0.05)
+
+        forward_task = asyncio.create_task(forward_stdout())
+        try:
+            while True:
+                message = await websocket.receive_text()
+                if message.strip().lower() in {"exit", "logout"}:
+                    if channel is not None:
+                        channel.send("exit\n")
+                    break
+                if fallback_mode:
+                    command = f"docker exec {shlex.quote(allocation.container_name)} bash -lc {shlex.quote(message)}"
+                    result = await asyncio.to_thread(runner.run, command, 60)
+                    await websocket.send_json(
+                        {
+                            "event": "output",
+                            "stream": "stdout",
+                            "data": result.stdout,
+                            "stderr": result.stderr,
+                            "exit_code": result.exit_code,
+                        }
+                    )
+                    if result.stderr:
+                        await websocket.send_json(
+                            {
+                                "event": "output",
+                                "stream": "stderr",
+                                "data": result.stderr,
+                                "exit_code": result.exit_code,
+                            }
+                        )
+                    continue
+                if channel is not None:
+                    channel.send(message + "\n")
+        except WebSocketDisconnect:
+            pass
+        finally:
+            forward_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await forward_task
+            await websocket.close()
+    finally:
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        db.close()
+
+
 @router.get("/hosts/{host_id}/metrics")
-def host_metrics(host_id: int):
+def host_metrics(request: Request, host_id: int):
     db: Session = SessionLocal()
     try:
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
@@ -983,76 +1832,74 @@ def host_metrics(host_id: int):
                 {"ok": False, "message": "未找到宿主机记录。", "error_log": f"host_id={host_id}"},
                 status_code=404,
             )
-
-        try:
-            docker = DockerService(host)
-            reachable = docker.ping(timeout=4)
-            container_rows = (
-                docker.managed_container_rows(host.port_start, host.port_end, timeout=6)
-                if reachable
-                else []
-            )
-            stats_list = docker.list_container_stats(timeout=6) if reachable else []
-            gpus = docker.gpu_stats(timeout=4) if reachable else []
-            gpu_detail_by_name = docker.gpu_memory_detail_by_container(timeout=6) if reachable else {}
-            disk_usage_by_name = docker.container_disk_usage_gb_map(timeout=6) if reachable else {}
-        except RunnerError as exc:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "message": "实时监控刷新失败。",
-                    "error_log": exc.log_text() or str(exc),
-                },
-                status_code=200,
-            )
-
+        cached = host_cache_payload(host)
+        if not cached["refresh_in_progress"]:
+            if cache_needs_full_refresh(host, cached, db):
+                schedule_host_refresh(host_id, full=True)
+            elif (
+                not cached["refreshed_at"]
+                or (datetime.utcnow() - cached["refreshed_at"]).total_seconds() >= HOST_REFRESH_INTERVAL_SECONDS
+            ):
+                schedule_host_refresh(host_id, full=False)
         db_allocations = (
             db.query(Allocation)
             .filter(Allocation.host_id == host.id)
             .all()
         )
-        allocation_by_container_name = {
-            allocation.container_name: allocation for allocation in db_allocations
-        }
-        allocation_by_host_port = {
-            allocation.host_port: allocation for allocation in db_allocations
-        }
-        stats_by_name = {item.get("Name"): item for item in stats_list}
-        rows = []
-        for container_row in container_rows:
-            allocation = allocation_by_container_name.get(
-                container_row["container_name"]
-            ) or allocation_by_host_port.get(container_row["host_port"])
-            stats = stats_by_name.get(container_row["container_name"], {})
-            disk_usage = disk_usage_by_name.get(container_row["container_name"], {})
-            gpu_memory_detail = gpu_detail_by_name.get(container_row["container_name"], [])
-            gpu_memory_used_mb = sum(float(item.get("used_memory_mb") or 0.0) for item in gpu_memory_detail)
-            rows.append(
+        rows_data = build_host_rows_from_cached_data(host, db_allocations, cached)
+        if cache_needs_full_refresh(host, cached, db) and not cached["container_rows"]:
+            return JSONResponse(
                 {
-                    "registered": bool(allocation),
-                    "container_name": container_row["container_name"],
-                    "port": allocation.host_port if allocation else container_row["host_port"],
-                    "assignee": allocation.assignee if allocation else container_row["container_name"],
-                    "status": container_row["status"],
-                    "cpu_percent": round(parse_percent(stats.get("CPUPerc", "")), 2),
-                    "memory_used_gb": round(parse_memory_usage(stats.get("MemUsage", "")), 2),
-                    "gpu_memory_used_mb": round(gpu_memory_used_mb, 2),
-                    "gpu_memory_detail": gpu_memory_detail,
-                    "disk_used_gb": round(float(disk_usage.get("disk_used_gb") or 0.0), 2),
-                    "disk_virtual_gb": round(float(disk_usage.get("disk_virtual_gb") or 0.0), 2),
-                    "cpu_limit_cores": round(float(allocation.cpu_limit_cores or 0.0), 2) if allocation else 0.0,
-                    "memory_limit_gb": round(float(allocation.memory_limit_gb or 0.0), 2) if allocation else 0.0,
-                    "workspace_limit_gb": round(float(allocation.workspace_limit_gb or 0.0), 2) if allocation else 0.0,
+                    "ok": False,
+                    "reachable": False,
+                    "message": "监控状态正在初始化，请稍候。",
+                    "error_log": "暂无缓存，已触发后台全量刷新。",
+                    "updated_at": "正在更新",
+                    "last_status_at": "正在更新",
+                    "rows": rows_data["resource_chart_rows"],
+                    "gpus": cached["gpus"],
+                    "refresh_in_progress": cached["refresh_in_progress"],
+                },
+                status_code=200,
+            )
+        if cached["refresh_in_progress"]:
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "reachable": cached["reachable"],
+                    "message": "正在后台刷新宿主机状态，当前展示稳定缓存。",
+                    "updated_at": format_cache_time(cached["refreshed_at"]),
+                    "last_status_at": format_cache_time(cached["refreshed_at"]),
+                    "refresh_in_progress": True,
+                    "refresh_started_at": format_cache_time(cached["refresh_started_at"]),
+                    "rows": rows_data["resource_chart_rows"],
+                    "gpus": cached["gpus"],
                 }
             )
-
+        if not cached["reachable"]:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "reachable": False,
+                    "message": "实时监控刷新失败，已保留最后缓存状态。",
+                    "error_log": cached["error_log"] or "宿主机不可达",
+                    "updated_at": format_cache_time(cached["refreshed_at"]),
+                    "last_status_at": format_cache_time(cached["refreshed_at"]),
+                    "rows": rows_data["resource_chart_rows"],
+                    "gpus": cached["gpus"],
+                    "refresh_in_progress": cached["refresh_in_progress"],
+                },
+                status_code=200,
+            )
         return JSONResponse(
             {
                 "ok": True,
-                "reachable": reachable,
-                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                "rows": rows,
-                "gpus": gpus,
+                "reachable": cached["reachable"],
+                "updated_at": format_cache_time(cached["refreshed_at"]),
+                "last_status_at": format_cache_time(cached["refreshed_at"]),
+                "rows": rows_data["resource_chart_rows"],
+                "gpus": cached["gpus"],
+                "refresh_in_progress": cached["refresh_in_progress"],
             }
         )
     finally:
@@ -1088,6 +1935,9 @@ def create_allocation(
     base_image_override: str = Form(""),
     notes: str = Form(""),
 ):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):
@@ -1112,9 +1962,22 @@ def create_allocation(
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
         if not host:
             return respond_error("未找到宿主机记录。", status_code=404)
+        if host_port < host.port_start or host_port > host.port_end:
+            return respond_error(f"端口 {host_port} 不在当前宿主机端口池 {host.port_start}-{host.port_end} 内。")
         docker = DockerService(host)
         container_name = f"{slugify(host.name)}-{host_port}"
         logs.append(f"准备创建容器 {container_name}")
+        active_port_allocation = (
+            db.query(Allocation)
+            .filter(
+                Allocation.host_id == host_id,
+                Allocation.host_port == host_port,
+                Allocation.status != AllocationStatus.DELETED.value,
+            )
+            .first()
+        )
+        if active_port_allocation:
+            return respond_error(f"端口 {host_port} 已存在平台分配记录，请选择其他端口。")
         allocation = (
             db.query(Allocation)
             .filter(
@@ -1139,7 +2002,8 @@ def create_allocation(
             if host_port in used_ports:
                 return respond_error(f"端口 {host_port} 已被 Docker 实际占用，请选择其他端口。")
         logs.append("检查准入配额")
-        decision = check_allocation(db, host, cpu_limit_cores, memory_limit_gb)
+        decision = check_allocation(db, host, cpu_limit_cores, memory_limit_gb, workspace_limit_gb)
+        logs.extend(decision.warnings or [])
         if not decision.allowed:
             reason = "；".join(decision.reasons)
             return respond_error(reason)
@@ -1175,6 +2039,15 @@ def create_allocation(
         db.flush()
         logs.append("开始创建并验证容器")
         DockerService(host).create_container(allocation, logs=logs)
+        upsert_cached_container_row(
+            db,
+            host.id,
+            allocation.container_name,
+            allocation.host_port,
+            allocation.image_name,
+            AllocationStatus.RUNNING.value,
+        )
+        schedule_host_refresh(host.id, full=False)
         db.commit()
         if is_ajax:
             return log_response(logs + ["容器创建成功"], ok=True, message=f"容器创建成功，端口 {host_port} 已分配给 {assignee}。")
@@ -1211,6 +2084,9 @@ def update_allocation_resources(
     memory_limit_gb: float = Form(...),
     workspace_limit_gb: float = Form(...),
 ):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):
@@ -1241,12 +2117,19 @@ def update_allocation_resources(
             allocation.host,
             cpu_limit_cores,
             memory_limit_gb,
+            workspace_limit_gb,
             exclude_allocation_id=allocation.id,
         )
+        logs.extend(decision.warnings or [])
         if not decision.allowed:
             reason = "；".join(decision.reasons)
             return respond_error(reason)
 
+        original_state = {
+            "cpu_limit_cores": allocation.cpu_limit_cores,
+            "memory_limit_gb": allocation.memory_limit_gb,
+            "workspace_limit_gb": allocation.workspace_limit_gb,
+        }
         allocation.cpu_limit_cores = cpu_limit_cores
         allocation.memory_limit_gb = memory_limit_gb
         allocation.workspace_limit_gb = workspace_limit_gb
@@ -1286,6 +2169,9 @@ def update_allocation_mounts(
     allocation_id: int,
     extra_mounts: str = Form(""),
 ):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):
@@ -1343,6 +2229,9 @@ def allocation_action(
     allocation_id: int,
     action: str = Form(...),
 ):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):
@@ -1381,7 +2270,11 @@ def allocation_action(
                 success_message = f"端口 {allocation.host_port} 已启动。"
         elif action == "delete":
             logs.append(f"尝试删除端口 {allocation.host_port} 容器")
+            deleted_container_name = allocation.container_name
             docker.remove_container(allocation)
+            if remove_cached_container_row(db, allocation.host_id, deleted_container_name):
+                logs.append("已从平台缓存中释放该端口")
+            schedule_host_refresh(allocation.host_id, full=False)
             success_message = f"端口 {allocation.host_port} 对应容器已删除。"
         else:
             return respond_error("不支持的操作类型。", status_code=400)
@@ -1432,6 +2325,9 @@ def external_container_action(
     container_name: str = Form(...),
     action: str = Form(...),
 ):
+    admin_response = require_admin_response(request, f"/hosts/{host_id}")
+    if admin_response:
+        return admin_response
     db: Session = SessionLocal()
     try:
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
@@ -1465,6 +2361,10 @@ def external_container_action(
             message = f"容器 {container_name} 已启动。"
         elif action == "delete":
             docker.remove_container_by_name(container_name)
+            cache_changed = remove_cached_container_row(db, host.id, container_name)
+            if cache_changed:
+                db.commit()
+            schedule_host_refresh(host.id, full=False)
             message = f"容器 {container_name} 已删除。"
         else:
             response = ajax_response(request, False, "不支持的操作类型。", status_code=400)
@@ -1495,6 +2395,10 @@ def external_container_action(
 
 @router.post("/hosts/{host_id}/containers/restart-all/stream")
 def restart_all_host_containers_stream(request: Request, host_id: int):
+    admin_response = require_admin_response(request, f"/hosts/{host_id}")
+    if admin_response:
+        return admin_response
+
     def generate():
         db: Session = SessionLocal()
         try:
@@ -1600,6 +2504,9 @@ def create_snapshot(
     snapshot_keep_count: int = Form(...),
     snapshot_interval_days: int = Form(...),
 ):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):
@@ -1667,10 +2574,15 @@ def create_snapshot(
 
 @router.post("/allocations/{allocation_id}/snapshot/stream")
 def create_snapshot_stream(
+    request: Request,
     allocation_id: int,
     snapshot_keep_count: int = Form(...),
     snapshot_interval_days: int = Form(...),
 ):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
+
     def generate():
         db: Session = SessionLocal()
         logs: list[str] = []
@@ -1742,6 +2654,9 @@ def create_snapshot_stream(
 
 @router.post("/allocations/{allocation_id}/restore/{snapshot_id}")
 def restore_snapshot(request: Request, allocation_id: int, snapshot_id: int):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     def respond_success(message: str):

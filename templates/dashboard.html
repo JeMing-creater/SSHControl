@@ -1,12 +1,17 @@
 {% extends "base.html" %}
 
 {% block content %}
-<section class="hero">
+<section class="hero compact">
     <div>
         <p class="eyebrow">总览</p>
         <h2>通过 SSH 集中控制多宿主机容器分配、快照和资源准入</h2>
         <p class="muted">平台按端口分配长期在线容器，默认共享 <code>/mnt</code>，支持 CPU / 内存在线调整，并展示宿主机 Docker 的真实状态。</p>
     </div>
+    {% if not is_user_view %}
+    <div class="hero-actions">
+        <a class="button" href="/hosts">接入新SSH宿主机</a>
+    </div>
+    {% endif %}
 </section>
 
 <section class="compute-overview">
@@ -54,6 +59,7 @@
                 <dd>{{ "%.1f"|format(card.summary.allocated_memory_gb) }} / {{ "%.1f"|format(card.total_memory_gb) if card.total_memory_gb else '-' }} GB</dd>
             </div>
         </dl>
+        <p class="status-timestamp">最后状态更新时间：{{ card.last_status_at }}</p>
         <div class="gpu-list">
             {% if card.summary.gpus %}
                 {% for gpu in card.summary.gpus %}
@@ -69,14 +75,17 @@
         </div>
         <div class="hero-actions">
             <a class="button secondary" href="/hosts/{{ card.host.id }}">进入宿主机</a>
+            {% if not is_user_view %}
             <form class="confirm-ajax-form" method="post" action="/hosts/{{ card.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？这不会删除远端服务器本身，只会删除平台记录。">
                 <button class="button danger" type="submit">移除记录</button>
             </form>
+            {% endif %}
         </div>
     </article>
     {% endfor %}
 </section>
 
+{% if not is_user_view %}
 <section class="panel">
     <div class="panel-head">
         <div>
@@ -117,6 +126,7 @@
         </tbody>
     </table>
 </section>
+{% endif %}
 
 <script>
 (() => {
@@ -130,8 +140,10 @@
     const gpuPercentEl = document.getElementById("compute-gpu-percent");
     const containerCountEl = document.getElementById("compute-container-count");
     const font = '"HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", sans-serif';
+    const isUserView = {{ is_user_view | tojson }};
     const nodes = new Map();
     let payload = initialPayload;
+    let hoveredNode = null;
 
     const resize = () => {
         const rect = canvas.parentElement.getBoundingClientRect();
@@ -140,6 +152,25 @@
         canvas.height = Math.floor(Math.max(340, Math.min(rect.width * 0.32, 500)) * ratio);
         canvas.style.height = `${canvas.height / ratio}px`;
         ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    };
+
+    const pointerPosition = (event) => {
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: event.clientX - rect.left,
+            y: event.clientY - rect.top
+        };
+    };
+
+    const hitTestNode = (x, y) => {
+        const candidates = [...nodes.values()].reverse();
+        return candidates.find((node) => {
+            if (!node.hitBox) {
+                return false;
+            }
+            const box = node.hitBox;
+            return x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height;
+        }) || null;
     };
 
     const syncNodes = () => {
@@ -169,9 +200,9 @@
 
     const drawSoftLine = (x1, y1, x2, y2, alpha) => {
         const gradient = ctx.createLinearGradient(x1, y1, x2, y2);
-        gradient.addColorStop(0, `rgba(20, 116, 102, ${0.04 * alpha})`);
-        gradient.addColorStop(0.5, `rgba(47, 134, 214, ${0.22 * alpha})`);
-        gradient.addColorStop(1, `rgba(20, 116, 102, ${0.05 * alpha})`);
+        gradient.addColorStop(0, `rgba(46, 49, 146, ${0.04 * alpha})`);
+        gradient.addColorStop(0.5, `rgba(13, 127, 196, ${0.22 * alpha})`);
+        gradient.addColorStop(1, `rgba(46, 49, 146, ${0.05 * alpha})`);
         ctx.strokeStyle = gradient;
         ctx.lineWidth = 1.4;
         ctx.beginPath();
@@ -180,12 +211,82 @@
         ctx.stroke();
     };
 
+    const drawHubServer = (x, y, scale = 1, { label = "总机", subtitle = "", opacity = 0.3, active = false } = {}) => {
+        const s = Math.max(0.62, scale);
+        const box = {
+            x: x - 56 * s,
+            y: y - 50 * s,
+            width: 112 * s,
+            height: (subtitle ? 126 : 106) * s
+        };
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.globalAlpha = opacity;
+        ctx.shadowColor = `rgba(46, 49, 146, ${active ? 0.22 : 0.16})`;
+        ctx.shadowBlur = 14 + s * 10;
+        ctx.fillStyle = `rgba(46, 49, 146, ${active ? 0.12 : 0.08})`;
+        ctx.beginPath();
+        ctx.ellipse(0, 30 * s, 46 * s, 12 * s, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.strokeStyle = active ? "rgba(13, 127, 196, 0.72)" : "rgba(46, 49, 146, 0.42)";
+        ctx.lineWidth = 1.2;
+        ctx.fillStyle = active ? "rgba(238, 246, 255, 0.98)" : "rgba(229, 240, 255, 0.94)";
+        ctx.beginPath();
+        ctx.moveTo(-20 * s, -24 * s);
+        ctx.lineTo(14 * s, -36 * s);
+        ctx.lineTo(28 * s, -22 * s);
+        ctx.lineTo(-6 * s, -8 * s);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = active ? "rgba(198, 224, 255, 0.98)" : "rgba(184, 211, 244, 0.95)";
+        ctx.beginPath();
+        ctx.moveTo(-6 * s, -8 * s);
+        ctx.lineTo(28 * s, -22 * s);
+        ctx.lineTo(28 * s, 18 * s);
+        ctx.lineTo(-6 * s, 34 * s);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = active ? "rgba(222, 238, 255, 0.98)" : "rgba(210, 229, 252, 0.95)";
+        ctx.beginPath();
+        ctx.moveTo(-20 * s, -24 * s);
+        ctx.lineTo(-6 * s, -8 * s);
+        ctx.lineTo(-6 * s, 34 * s);
+        ctx.lineTo(-20 * s, 18 * s);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(46, 49, 146, 0.66)";
+        ctx.fillRect(-14 * s, 38 * s, 28 * s, 3.5 * s);
+        ctx.beginPath();
+        ctx.roundRect(-20 * s, 42 * s, 40 * s, 5 * s, 3 * s);
+        ctx.fill();
+        ctx.restore();
+
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.fillStyle = "rgba(31, 39, 69, 0.72)";
+        ctx.font = `700 12px ${font}`;
+        ctx.textAlign = "center";
+        ctx.fillText(label, 0, 61 * s);
+        if (subtitle) {
+            ctx.fillStyle = "rgba(46, 49, 146, 0.56)";
+            ctx.font = `11px ${font}`;
+            ctx.fillText(subtitle, 0, 77 * s);
+        }
+        ctx.restore();
+        return box;
+    };
+
     const drawSurface = (time) => {
         const hosts = payload.hosts || [];
         const w = canvas.clientWidth;
         const h = canvas.clientHeight;
         const cols = 78;
         const rows = 18;
+        const padX = 120;
         const grid = [];
         for (let j = 0; j < rows; j += 1) {
             const row = [];
@@ -199,10 +300,16 @@
                     const cy = 0.5 + 0.12 * Math.sin(index * 1.25);
                     const dx = nx - cx;
                     const dy = ny - cy;
-                    const intensity = Math.max(0, Number(host.intensity || 0));
+                    const rawIntensity = Math.max(0, Number(host.intensity || 0));
+                    const peakCurve = rawIntensity <= 0.5
+                        ? 0
+                        : Math.pow((rawIntensity - 0.5) / 0.5, 0.62);
+                    const intensity = rawIntensity <= 0.5
+                        ? rawIntensity
+                        : 0.5 + peakCurve * 0.95;
                     const bump = Math.exp(-(dx * dx / 0.012 + dy * dy / 0.046));
                     influence += bump;
-                    z += bump * (8 + 128 * intensity);
+                    z += bump * (8 + 104 * intensity + peakCurve * 156);
                 });
                 z += Math.sin(time * 0.0018 + i * 0.28 + j * 0.18) * 1.6;
                 const x = w * 0.29 + nx * w * 0.42 + (j - rows / 2) * 8.5;
@@ -219,12 +326,24 @@
                 const p2 = grid[j][i + 1];
                 const p3 = grid[j + 1][i + 1];
                 const p4 = grid[j + 1][i];
+                if (Math.max(p.x, p2.x, p3.x, p4.x) < -padX || Math.min(p.x, p2.x, p3.x, p4.x) > w + padX) {
+                    continue;
+                }
                 const influence = Math.min((p.influence + p2.influence + p3.influence + p4.influence) / 2.6, 1);
                 const shade = Math.min((p.z + p2.z + p3.z + p4.z) / 330, 1);
-                const alpha = Math.min(0.035 + influence * 0.16 + shade * 0.38, 0.72);
-                ctx.fillStyle = `rgba(${155 + shade * 95}, ${221 + shade * 22}, ${205 - shade * 70}, ${alpha})`;
-                ctx.strokeStyle = `rgba(20, 116, 102, ${0.045 + influence * 0.2 + shade * 0.08})`;
-                ctx.lineWidth = 0.58 + shade * 0.42;
+                const edgeFade = Math.min(
+                    1,
+                    Math.max(0, Math.min(p.x, p2.x, p3.x, p4.x) + padX) / padX,
+                    Math.max(0, w + padX - Math.max(p.x, p2.x, p3.x, p4.x)) / padX
+                );
+                const peakBoost = shade > 0.5 ? Math.pow((shade - 0.5) / 0.5, 0.58) : 0;
+                const alpha = Math.min(0.035 + influence * 0.16 + shade * 0.34 + peakBoost * 0.28, 0.88) * edgeFade;
+                if (alpha <= 0.002) {
+                    continue;
+                }
+                ctx.fillStyle = `rgba(${160 + shade * 78}, ${202 + shade * 28}, ${246 - shade * 14}, ${alpha})`;
+                ctx.strokeStyle = `rgba(46, 49, 146, ${(0.045 + influence * 0.2 + shade * 0.06 + peakBoost * 0.24) * edgeFade})`;
+                ctx.lineWidth = 0.58 + shade * 0.44 + peakBoost * 0.62;
                 ctx.beginPath();
                 ctx.moveTo(p.x, p.y);
                 ctx.lineTo(p2.x, p2.y);
@@ -243,13 +362,14 @@
             if (intensity <= 0.02) {
                 return;
             }
-            const glow = ctx.createRadialGradient(x, y - 88 * intensity, 0, x, y - 88 * intensity, 78 + intensity * 48);
-            glow.addColorStop(0, `rgba(255, 239, 140, ${0.34 + intensity * 0.36})`);
-            glow.addColorStop(0.34, `rgba(50, 190, 150, ${0.18 + intensity * 0.18})`);
-            glow.addColorStop(1, "rgba(50, 190, 150, 0)");
+            const peakBoost = intensity > 0.5 ? Math.pow((intensity - 0.5) / 0.5, 0.62) : 0;
+            const glow = ctx.createRadialGradient(x, y - 94 * intensity, 0, x, y - 94 * intensity, 82 + intensity * 50 + peakBoost * 30);
+            glow.addColorStop(0, `rgba(186, 224, 255, ${0.34 + intensity * 0.32 + peakBoost * 0.24})`);
+            glow.addColorStop(0.34, `rgba(13, 127, 196, ${0.18 + intensity * 0.16 + peakBoost * 0.16})`);
+            glow.addColorStop(1, "rgba(13, 127, 196, 0)");
             ctx.fillStyle = glow;
             ctx.beginPath();
-            ctx.arc(x, y - 88 * intensity, 84 + intensity * 50, 0, Math.PI * 2);
+            ctx.arc(x, y - 94 * intensity, 84 + intensity * 56 + peakBoost * 18, 0, Math.PI * 2);
             ctx.fill();
         });
         ctx.restore();
@@ -259,22 +379,32 @@
         node.x += (node.tx - node.x) * 0.06;
         node.y += (node.ty - node.y) * 0.06;
         const host = node.host;
+        const allowed = host.allowed !== false;
         const bob = Math.sin(time * 0.002 + node.phase) * 4;
         const x = node.x;
         const y = node.y + bob;
         const intensity = Math.max(0.08, Number(host.intensity || 0));
+        const isHovered = hoveredNode && String(hoveredNode.host.id) === String(host.id);
+        node.hitBox = { x: x - 54, y: y - 48, width: 108, height: 134 };
         ctx.save();
+        ctx.globalAlpha = allowed ? 1 : 0.34;
         ctx.translate(x, y);
-        ctx.shadowColor = `rgba(20, 116, 102, ${0.22 + intensity * 0.22})`;
-        ctx.shadowBlur = 16 + intensity * 18;
-        ctx.fillStyle = `rgba(20, 116, 102, ${0.12 + intensity * 0.16})`;
+        ctx.shadowColor = allowed
+            ? `rgba(46, 49, 146, ${0.22 + intensity * 0.22 + (isHovered ? 0.18 : 0)})`
+            : "rgba(104, 114, 140, 0.12)";
+        ctx.shadowBlur = allowed ? 16 + intensity * 18 + (isHovered ? 14 : 0) : 7;
+        ctx.fillStyle = allowed ? `rgba(46, 49, 146, ${0.12 + intensity * 0.16})` : "rgba(104, 114, 140, 0.11)";
         ctx.beginPath();
         ctx.ellipse(0, 30, 46, 12, 0, 0, Math.PI * 2);
         ctx.fill();
         ctx.shadowBlur = 0;
-        ctx.fillStyle = "rgba(227, 244, 239, 0.94)";
-        ctx.strokeStyle = "rgba(20, 116, 102, 0.48)";
-        ctx.lineWidth = 1.3;
+        ctx.fillStyle = allowed
+            ? (isHovered ? "rgba(238, 246, 255, 0.98)" : "rgba(229, 240, 255, 0.94)")
+            : "rgba(224, 229, 238, 0.9)";
+        ctx.strokeStyle = allowed
+            ? (isHovered ? "rgba(13, 127, 196, 0.86)" : "rgba(46, 49, 146, 0.48)")
+            : "rgba(104, 114, 140, 0.38)";
+        ctx.lineWidth = allowed && isHovered ? 2 : 1.3;
         ctx.beginPath();
         ctx.moveTo(-20, -24);
         ctx.lineTo(14, -36);
@@ -283,7 +413,9 @@
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
-        ctx.fillStyle = "rgba(185, 218, 209, 0.95)";
+        ctx.fillStyle = allowed
+            ? (isHovered ? "rgba(198, 224, 255, 0.98)" : "rgba(184, 211, 244, 0.95)")
+            : "rgba(209, 216, 228, 0.9)";
         ctx.beginPath();
         ctx.moveTo(-6, -8);
         ctx.lineTo(28, -22);
@@ -292,7 +424,9 @@
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
-        ctx.fillStyle = "rgba(210, 235, 229, 0.95)";
+        ctx.fillStyle = allowed
+            ? (isHovered ? "rgba(222, 238, 255, 0.98)" : "rgba(210, 229, 252, 0.95)")
+            : "rgba(218, 224, 235, 0.9)";
         ctx.beginPath();
         ctx.moveTo(-20, -24);
         ctx.lineTo(-6, -8);
@@ -301,11 +435,11 @@
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
-        ctx.fillStyle = "rgba(32, 40, 36, 0.88)";
+        ctx.fillStyle = allowed ? "rgba(31, 39, 69, 0.88)" : "rgba(104, 114, 140, 0.82)";
         ctx.font = `700 13px ${font}`;
         ctx.textAlign = "center";
         ctx.fillText(host.name, 0, 55);
-        ctx.fillStyle = "rgba(20, 116, 102, 0.82)";
+        ctx.fillStyle = allowed ? "rgba(46, 49, 146, 0.82)" : "rgba(104, 114, 140, 0.7)";
         ctx.font = `12px ${font}`;
         ctx.fillText(`${Number(host.gpu_percent || 0).toFixed(1)}% 显存 / ${host.running_count} running`, 0, 73);
         ctx.restore();
@@ -316,17 +450,39 @@
         const w = canvas.clientWidth;
         const h = canvas.clientHeight;
         ctx.clearRect(0, 0, w, h);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, w, h);
+        ctx.clip();
         const bg = ctx.createLinearGradient(0, 0, w, h);
-        bg.addColorStop(0, "rgba(251,253,251,0.98)");
-        bg.addColorStop(0.55, "rgba(246,250,248,0.92)");
-        bg.addColorStop(1, "rgba(239,247,244,0.82)");
+        bg.addColorStop(0, "rgba(251,252,255,0.98)");
+        bg.addColorStop(0.55, "rgba(246,249,255,0.92)");
+        bg.addColorStop(1, "rgba(238,245,255,0.82)");
         ctx.fillStyle = bg;
         ctx.fillRect(0, 0, w, h);
         drawSurface(time);
         const hubX = w / 2;
-        const hubY = h * 0.48;
+        const hubY = h * 0.31;
         nodes.forEach((node) => drawSoftLine(hubX, hubY, node.x, node.y, 1));
         nodes.forEach((node) => drawNode(node, time));
+        drawHubServer(hubX, hubY, 1, {
+            label: "总机",
+            subtitle: "平台中心",
+            opacity: 0.3,
+            active: true
+        });
+        const leftFade = ctx.createLinearGradient(0, 0, Math.min(170, w * 0.16), 0);
+        leftFade.addColorStop(0, "rgba(251,252,255,0.96)");
+        leftFade.addColorStop(1, "rgba(251,252,255,0)");
+        ctx.fillStyle = leftFade;
+        ctx.fillRect(0, 0, Math.min(170, w * 0.16), h);
+        const rightFadeWidth = Math.min(190, w * 0.18);
+        const rightFade = ctx.createLinearGradient(w - rightFadeWidth, 0, w, 0);
+        rightFade.addColorStop(0, "rgba(251,252,255,0)");
+        rightFade.addColorStop(1, "rgba(251,252,255,0.96)");
+        ctx.fillStyle = rightFade;
+        ctx.fillRect(w - rightFadeWidth, 0, rightFadeWidth, h);
+        ctx.restore();
         requestAnimationFrame(draw);
     };
 
@@ -351,6 +507,27 @@
     syncNodes();
     requestAnimationFrame(draw);
     window.addEventListener("resize", resize);
+    canvas.addEventListener("mousemove", (event) => {
+        const point = pointerPosition(event);
+        hoveredNode = hitTestNode(point.x, point.y);
+        const canOpen = hoveredNode && hoveredNode.host && hoveredNode.host.allowed !== false;
+        canvas.classList.toggle("is-clickable", Boolean(canOpen));
+        canvas.title = canOpen
+            ? (isUserView ? `进入 ${hoveredNode.host.name} 状态页面` : `进入 ${hoveredNode.host.name} 宿主机管理页面`)
+            : "";
+    });
+    canvas.addEventListener("mouseleave", () => {
+        hoveredNode = null;
+        canvas.classList.remove("is-clickable");
+        canvas.title = "";
+    });
+    canvas.addEventListener("click", (event) => {
+        const point = pointerPosition(event);
+        const node = hitTestNode(point.x, point.y);
+        if (node && node.host && node.host.id && node.host.allowed !== false) {
+            window.location.href = `/hosts/${node.host.id}`;
+        }
+    });
     window.setInterval(refresh, 8000);
 })();
 </script>

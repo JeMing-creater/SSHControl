@@ -3,12 +3,28 @@
 {% block content %}
 <section class="hero compact">
     <div>
-        <p class="eyebrow">宿主机详情</p>
+        <p class="eyebrow">{{ '宿主机状态' if is_user_view else '宿主机详情' }}</p>
         <h2>{{ host.name }}</h2>
         <p class="muted">{{ host.address }}:{{ host.ssh_port }} | 端口池 {{ host.port_start }} - {{ host.port_end }}</p>
+        <p class="host-status-line">
+            <span id="host-refresh-state" class="monitor-state">{{ '后台刷新中，当前展示稳定缓存' if refresh_in_progress else '展示稳定缓存' }}</span>
+            <span>最后状态更新时间：<strong id="host-last-status-at">{{ last_status_at }}</strong></span>
+        </p>
+        {% if last_status_error %}
+        <p class="muted">上次刷新异常：{{ last_status_error[:180] }}</p>
+        {% endif %}
     </div>
     <div class="hero-actions">
-        <a class="button secondary" href="/hosts">返回宿主机列表</a>
+        {% if not is_user_view %}
+        <a class="button" href="/hosts/{{ host.id }}/terminal">SSH 命令行</a>
+        {% else %}
+            {% for row in container_rows %}
+            {% if row.registered and row.status == "running" and row.allocation.id in owned_allocation_ids %}
+            <a class="button" href="/allocations/{{ row.allocation.id }}/terminal">容器命令行 {{ row.host_port }}</a>
+            {% endif %}
+            {% endfor %}
+        {% endif %}
+        <a class="button secondary" href="/">返回总览</a>
     </div>
 </section>
 
@@ -18,9 +34,23 @@
 {% if docker_error %}
 <section class="banner bad">{{ docker_error }}</section>
 {% endif %}
+<section class="host-visual-panel">
+    <div class="host-visual-head">
+        <div>
+            <p class="eyebrow">宿主机算力视图</p>
+            <h3>{{ host.name }} 实时占用热力</h3>
+        </div>
+        <div class="compute-overview-kpis">
+            <span><strong>{{ summary.container_count }}</strong> 个容器</span>
+            <span><strong>{{ "%.0f"|format(resource_chart_rows | sum(attribute="gpu_memory_used_mb")) }}</strong> MB 显存</span>
+        </div>
+    </div>
+    <canvas id="host-visual-canvas" width="1400" height="420"></canvas>
+</section>
 <section id="toast" class="toast hidden" aria-live="polite">
     <div id="toast-body" class="toast-body"></div>
 </section>
+{% if not is_user_view %}
 <section id="snapshot-modal" class="modal hidden" aria-hidden="true">
     <div class="modal-backdrop"></div>
     <div class="modal-card">
@@ -126,6 +156,7 @@
         </div>
     </div>
 </section>
+{% endif %}
 <section id="feedback-modal" class="modal hidden" aria-hidden="true">
     <div class="modal-backdrop"></div>
     <div class="modal-card">
@@ -149,6 +180,7 @@
 </section>
 
 <section class="grid cards three">
+    {% if not is_user_view %}
     <article class="card">
         <p class="eyebrow">准入状态</p>
         <h3>{{ 'Docker 在线' if summary.reachable else 'Docker 不可达' }}</h3>
@@ -189,8 +221,10 @@
             <button class="button tiny async-submit-button" type="submit">更新快照策略</button>
         </form>
     </article>
+    {% endif %}
 </section>
 
+{% if not is_user_view %}
 <section class="split wide-left">
     <article class="panel">
         <div class="panel-head">
@@ -266,6 +300,32 @@
         </div>
     </article>
 </section>
+{% else %}
+<section class="panel">
+    <div class="panel-head">
+        <div>
+            <p class="eyebrow">GPU 总览</p>
+            <h3>整机共享 GPU</h3>
+        </div>
+    </div>
+    <div class="gpu-list stacked">
+        {% for gpu in summary.gpus %}
+        <div class="gpu-chip large">
+            <div>
+                <strong>GPU {{ gpu.index }}</strong>
+                <p>{{ gpu.name }}</p>
+            </div>
+            <div>
+                <strong>{{ gpu.utilization_gpu }}%</strong>
+                <p>{{ gpu.memory_used_mb|int }} / {{ gpu.memory_total_mb|int }} MB</p>
+            </div>
+        </div>
+        {% else %}
+        <p class="muted">未获取到 GPU 状态</p>
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
 
 <section class="panel">
     <div class="panel-head chart-head">
@@ -278,9 +338,9 @@
         <div class="chart-toolbar">
             <label>排序维度
                 <select id="resource-sort-key">
-                    <option value="cpu">CPU</option>
-                    <option value="memory">内存</option>
                     <option value="gpu">显卡资源</option>
+                    <option value="cpu">CPU</option>
+                    <option value="memory">内存资源</option>
                     <option value="disk">硬盘资源</option>
                 </select>
             </label>
@@ -296,11 +356,20 @@
 <section class="panel">
     <div class="panel-head">
         <div>
-            <p class="eyebrow">统一维护</p>
+                <p class="eyebrow">{{ '资源查看' if is_user_view else '统一维护' }}</p>
             <h3>全部端口容器</h3>
-            <p class="muted">登记容器支持资源、挂载、快照和连接信息维护；未登记容器仅支持启动、停止、删除。</p>
+            <p class="muted">
+                {% if is_user_view %}
+                当前账号可查看全部容器资源占用；命令行仅开放本人容器。
+                当前页展示 {{ container_rows|length }} 个容器，其中本人容器 {{ owned_visible_container_count }} 个。
+                {% else %}
+                登记容器支持资源、挂载、快照和连接信息维护；未登记容器仅支持启动、停止、删除。
+                {% endif %}
+            </p>
         </div>
+        {% if not is_user_view %}
         <button class="button danger" type="button" id="restart-all-open">一键重启所有镜像</button>
+        {% endif %}
     </div>
     <table class="table">
         <thead>
@@ -312,7 +381,7 @@
                 <th>状态</th>
                 <th>资源</th>
                 <th>实时占用</th>
-                <th>维护</th>
+                <th>{{ '命令行' if is_user_view else '维护' }}</th>
             </tr>
         </thead>
         <tbody>
@@ -349,7 +418,7 @@
                 </td>
                 <td>{{ row.status }}</td>
                 <td>
-                    {% if row.registered %}
+                    {% if row.registered and not is_user_view %}
                     <form class="inline-form async-form" method="post" action="/allocations/{{ row.allocation.id }}/resources">
                         <label class="resource-field">CPU 上限(核)
                             <input name="cpu_limit_cores" type="number" step="0.1" value="{{ row.allocation.cpu_limit_cores }}">
@@ -363,6 +432,10 @@
                         <button class="button tiny async-submit-button" type="submit">更新</button>
                     </form>
                     <small class="muted">CPU / 内存可热更新；workspace 目前作为记录值。</small>
+                    {% elif row.registered %}
+                    <div>CPU 上限 {{ row.allocation.cpu_limit_cores }} 核</div>
+                    <div>内存上限 {{ row.allocation.memory_limit_gb }} GB</div>
+                    <div>workspace 上限 {{ row.allocation.workspace_limit_gb }} GB</div>
                     {% else %}
                     <button class="ghost-field unregistered-field" type="button">原始 CPU / 内存 / workspace 设定</button>
                     {% endif %}
@@ -381,7 +454,15 @@
                     <div>Docker 磁盘 {{ "%.1f"|format(row.disk_used_gb) }} GB</div>
                 </td>
                 <td>
-                    {% if row.registered %}
+                    {% if is_user_view %}
+                    {% if row.registered and row.status == "running" and row.allocation.id in owned_allocation_ids %}
+                    <a class="button tiny secondary" href="/allocations/{{ row.allocation.id }}/terminal">容器命令行</a>
+                    {% elif row.registered and row.status == "running" %}
+                    <span class="muted">他人容器</span>
+                    {% else %}
+                    <span class="muted">容器未运行</span>
+                    {% endif %}
+                    {% elif row.registered %}
                     <form class="inline-form stack async-form" method="post" action="/allocations/{{ row.allocation.id }}/mounts">
                         <textarea name="extra_mounts" rows="2" placeholder="/new/path:/new/path;/new2:/new2">{{ row.allocation.extra_mounts or "" }}</textarea>
                         <button class="button tiny secondary async-submit-button" type="submit">标记挂载变更</button>
@@ -392,6 +473,7 @@
                     {% else %}
                     <button class="ghost-field unregistered-field" type="button">原始挂载设定</button>
                     {% endif %}
+                    {% if not is_user_view %}
                     <div class="action-row">
                         {% if row.status == "running" %}
                         <form class="allocation-action-form" method="post" action="{{ '/allocations/' ~ row.allocation.id ~ '/action' if row.registered else '/hosts/' ~ host.id ~ '/containers/action' }}">
@@ -438,6 +520,7 @@
                         {% endif %}
                         {% endif %}
                     </div>
+                    {% endif %}
                 </td>
             </tr>
             {% else %}
@@ -449,6 +532,7 @@
     </table>
 </section>
 
+{% if not is_user_view %}
 <section class="panel">
     <div class="panel-head">
         <div>
@@ -489,8 +573,432 @@
         </tbody>
     </table>
 </section>
+{% endif %}
 
 <script>
+{% if is_user_view and not user_has_host_allocation %}
+window.addEventListener("DOMContentLoaded", () => {
+    window.showGlobalFeedback?.("您尚未在本机获得合法镜像，本页面仅供提供使用信息参考", "success");
+});
+{% endif %}
+
+(() => {
+    const currentHostId = String({{ host.id | tojson }});
+    const canvas = document.getElementById("host-visual-canvas");
+    if (!canvas) {
+        return;
+    }
+    const ctx = canvas.getContext("2d");
+    const font = '"HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", sans-serif';
+    const isUserView = {{ is_user_view | tojson }};
+    const nodes = new Map();
+    let payload = {{ visual | tojson }};
+    let heatRows = {{ resource_chart_rows | tojson }};
+    let hoveredNode = null;
+
+    const resize = () => {
+        const rect = canvas.parentElement.getBoundingClientRect();
+        const ratio = window.devicePixelRatio || 1;
+        canvas.width = Math.max(960, Math.floor(rect.width * ratio));
+        canvas.height = Math.floor(Math.max(320, Math.min(rect.width * 0.3, 460)) * ratio);
+        canvas.style.height = `${canvas.height / ratio}px`;
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    };
+
+    const pointerPosition = (event) => {
+        const rect = canvas.getBoundingClientRect();
+        return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    };
+
+    const hitTestNode = (x, y) => [...nodes.values()].reverse().find((node) => {
+        const box = node.hitBox;
+        return box && x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height;
+    }) || null;
+
+    const syncNodes = () => {
+        const hosts = payload.hosts || [];
+        const active = new Set(hosts.map((hostItem) => String(hostItem.id)));
+        hosts.forEach((hostItem, index) => {
+            const id = String(hostItem.id);
+            if (!nodes.has(id)) {
+                nodes.set(id, { x: 0, y: 0, phase: Math.random() * Math.PI * 2, host: hostItem });
+            }
+            const node = nodes.get(id);
+            node.host = hostItem;
+            const lane = hosts.length <= 1 ? 0.5 : index / Math.max(hosts.length - 1, 1);
+            node.tx = canvas.clientWidth * (0.24 + lane * 0.52);
+            node.ty = canvas.clientHeight * (0.68 + 0.045 * Math.sin(index * 1.4));
+            if (!node.x && !node.y) {
+                node.x = node.tx;
+                node.y = node.ty;
+            }
+        });
+        [...nodes.keys()].forEach((id) => {
+            if (!active.has(id)) {
+                nodes.delete(id);
+            }
+        });
+    };
+
+    const drawSoftLine = (x1, y1, x2, y2, alpha) => {
+        const gradient = ctx.createLinearGradient(x1, y1, x2, y2);
+        gradient.addColorStop(0, `rgba(46, 49, 146, ${0.035 * alpha})`);
+        gradient.addColorStop(0.5, `rgba(13, 127, 196, ${0.18 * alpha})`);
+        gradient.addColorStop(1, `rgba(46, 49, 146, ${0.035 * alpha})`);
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+    };
+
+    const hub = {
+        x: 0,
+        y: 0,
+        hitBox: null
+    };
+
+    const drawHub = (w, h, time) => {
+        const bob = Math.sin(time * 0.0016) * 1.8;
+        const x = w * 0.5;
+        const y = h * 0.25 + bob;
+        hub.x = x;
+        hub.y = y;
+        hub.hitBox = { x: x - 64, y: y - 44, width: 128, height: 106 };
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.shadowColor = "rgba(46, 49, 146, 0.22)";
+        ctx.shadowBlur = 16;
+        ctx.fillStyle = "rgba(46, 49, 146, 0.08)";
+        ctx.beginPath();
+        ctx.ellipse(0, 30, 46, 12, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.strokeStyle = "rgba(46, 49, 146, 0.44)";
+        ctx.lineWidth = 1.3;
+        ctx.fillStyle = "rgba(247, 250, 255, 0.98)";
+        ctx.beginPath();
+        ctx.moveTo(-20, -24);
+        ctx.lineTo(14, -36);
+        ctx.lineTo(28, -22);
+        ctx.lineTo(-6, -8);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(216, 229, 252, 0.98)";
+        ctx.beginPath();
+        ctx.moveTo(-6, -8);
+        ctx.lineTo(28, -22);
+        ctx.lineTo(28, 18);
+        ctx.lineTo(-6, 34);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(226, 239, 255, 0.98)";
+        ctx.beginPath();
+        ctx.moveTo(-20, -24);
+        ctx.lineTo(-6, -8);
+        ctx.lineTo(-6, 34);
+        ctx.lineTo(-20, 18);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(46, 49, 146, 0.66)";
+        ctx.fillRect(-14, 38, 28, 3.5);
+        ctx.beginPath();
+        ctx.roundRect(-20, 42, 40, 5, 3);
+        ctx.fill();
+        ctx.fillStyle = "rgba(31, 39, 69, 0.9)";
+        ctx.font = `700 12px ${font}`;
+        ctx.textAlign = "center";
+        ctx.fillText("总机", 0, 61);
+        ctx.fillStyle = "rgba(46, 49, 146, 0.76)";
+        ctx.font = `11px ${font}`;
+        ctx.fillText("点击返回总览", 0, 77);
+        ctx.restore();
+    };
+
+    const drawSurface = (time) => {
+        const hosts = payload.hosts || [];
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        const cols = 70;
+        const rows = 16;
+        const grid = [];
+        for (let j = 0; j < rows; j += 1) {
+            const row = [];
+            for (let i = 0; i < cols; i += 1) {
+                const nx = -0.9 + (i / (cols - 1)) * 2.8;
+                const ny = j / (rows - 1);
+                let z = 0;
+                let influence = 0;
+                hosts.forEach((hostItem, index) => {
+                    const cx = hosts.length <= 1 ? 0.5 : index / Math.max(hosts.length - 1, 1);
+                    const cy = 0.48 + 0.1 * Math.sin(index * 1.25);
+                    const focus = String(hostItem.id) === currentHostId;
+                    const dx = nx - cx;
+                    const dy = ny - cy;
+                    const intensity = Math.max(0, Number(hostItem.intensity || 0)) * (focus ? 1.35 : 0.28);
+                    const bump = Math.exp(-(dx * dx / (focus ? 0.012 : 0.02) + dy * dy / 0.046));
+                    influence += bump * (focus ? 1 : 0.25);
+                    z += bump * (6 + 124 * intensity);
+                });
+                z += Math.sin(time * 0.0018 + i * 0.24 + j * 0.18) * 1.4;
+                const x = w * 0.25 + nx * w * 0.38 + (j - rows / 2) * 8.5;
+                const y = h * 0.49 + (j - rows / 2) * 8 - z;
+                row.push({ x, y, z, influence });
+            }
+            grid.push(row);
+        }
+        for (let j = 0; j < rows - 1; j += 1) {
+            for (let i = 0; i < cols - 1; i += 1) {
+                const p = grid[j][i];
+                const p2 = grid[j][i + 1];
+                const p3 = grid[j + 1][i + 1];
+                const p4 = grid[j + 1][i];
+                const influence = Math.min((p.influence + p2.influence + p3.influence + p4.influence) / 2.4, 1);
+                const shade = Math.min((p.z + p2.z + p3.z + p4.z) / 310, 1);
+                const alpha = Math.min(0.025 + influence * 0.18 + shade * 0.36, 0.64);
+                ctx.fillStyle = `rgba(${166 + shade * 68}, ${206 + shade * 34}, ${248 - shade * 8}, ${alpha})`;
+                ctx.strokeStyle = `rgba(46, 49, 146, ${0.035 + influence * 0.2 + shade * 0.08})`;
+                ctx.lineWidth = 0.52 + shade * 0.4;
+                ctx.beginPath();
+                ctx.moveTo(p.x, p.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.lineTo(p3.x, p3.y);
+                ctx.lineTo(p4.x, p4.y);
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+    };
+
+    const drawNode = (node, time) => {
+        node.x += (node.tx - node.x) * 0.06;
+        node.y += (node.ty - node.y) * 0.06;
+        const hostItem = node.host;
+        const focus = String(hostItem.id) === currentHostId;
+        const allowed = hostItem.allowed !== false;
+        const isHovered = hoveredNode && String(hoveredNode.host.id) === String(hostItem.id);
+        const bob = Math.sin(time * 0.002 + node.phase) * (focus ? 4 : 2.5);
+        const x = node.x;
+        const y = node.y + bob;
+        const intensity = Math.max(0.08, Number(hostItem.intensity || 0));
+        const alpha = focus ? 1 : (allowed ? 0.28 : 0.16);
+        node.hitBox = { x: x - 54, y: y - 48, width: 108, height: 132 };
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(x, y);
+        ctx.shadowColor = `rgba(46, 49, 146, ${focus ? 0.38 + intensity * 0.32 : 0.08})`;
+        ctx.shadowBlur = (focus ? 22 : 8) + (isHovered ? 12 : 0);
+        ctx.fillStyle = `rgba(46, 49, 146, ${focus ? 0.2 + intensity * 0.18 : 0.1})`;
+        ctx.beginPath();
+        ctx.ellipse(0, 30, focus ? 50 : 42, focus ? 13 : 10, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = focus || isHovered ? "rgba(238, 246, 255, 0.98)" : "rgba(229, 240, 255, 0.9)";
+        ctx.strokeStyle = focus || isHovered ? "rgba(13, 127, 196, 0.86)" : "rgba(46, 49, 146, 0.38)";
+        ctx.lineWidth = focus || isHovered ? 2 : 1.1;
+        ctx.beginPath();
+        ctx.moveTo(-20, -24);
+        ctx.lineTo(14, -36);
+        ctx.lineTo(28, -22);
+        ctx.lineTo(-6, -8);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = focus || isHovered ? "rgba(198, 224, 255, 0.98)" : "rgba(184, 211, 244, 0.88)";
+        ctx.beginPath();
+        ctx.moveTo(-6, -8);
+        ctx.lineTo(28, -22);
+        ctx.lineTo(28, 18);
+        ctx.lineTo(-6, 34);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = focus || isHovered ? "rgba(222, 238, 255, 0.98)" : "rgba(210, 229, 252, 0.88)";
+        ctx.beginPath();
+        ctx.moveTo(-20, -24);
+        ctx.lineTo(-6, -8);
+        ctx.lineTo(-6, 34);
+        ctx.lineTo(-20, 18);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = focus ? "rgba(31, 39, 69, 0.92)" : (allowed ? "rgba(31, 39, 69, 0.58)" : "rgba(104, 114, 140, 0.5)");
+        ctx.font = `700 ${focus ? 13 : 12}px ${font}`;
+        ctx.textAlign = "center";
+        ctx.fillText(hostItem.name, 0, 55);
+        ctx.fillStyle = focus ? "rgba(46, 49, 146, 0.88)" : (allowed ? "rgba(46, 49, 146, 0.54)" : "rgba(104, 114, 140, 0.48)");
+        ctx.font = `12px ${font}`;
+        ctx.fillText(`${Number(hostItem.gpu_percent || 0).toFixed(1)}% 显存`, 0, 73);
+        ctx.restore();
+    };
+
+    const heatColor = (level, alpha) => {
+        if (level > 0.66) {
+            return `rgba(224, 83, 72, ${alpha})`;
+        }
+        if (level > 0.33) {
+            return `rgba(232, 157, 58, ${alpha})`;
+        }
+        return `rgba(13, 127, 196, ${alpha})`;
+    };
+
+    const drawHeatCards = () => {
+        const focusNode = nodes.get(currentHostId);
+        if (!focusNode) {
+            return;
+        }
+        const focusGpuPercent = Number(focusNode.host && focusNode.host.gpu_percent ? focusNode.host.gpu_percent : 0);
+        const rows = [...heatRows]
+            .filter((row) => Number(row.gpu_memory_used_mb || 0) > 0)
+            .sort((left, right) => Number(right.gpu_memory_used_mb || 0) - Number(left.gpu_memory_used_mb || 0))
+            .slice(0, 6);
+        if (!rows.length) {
+            ctx.save();
+            ctx.fillStyle = focusGpuPercent > 15
+                ? "rgba(46, 49, 146, 0.72)"
+                : "rgba(46, 49, 146, 0.48)";
+            ctx.font = `12px ${font}`;
+            ctx.textAlign = "left";
+            ctx.fillText(
+                focusGpuPercent > 15 ? "显存占用较高，正在更新状态..." : "暂无显存占用名片",
+                focusNode.x + 64,
+                focusNode.y - 20
+            );
+            ctx.restore();
+            return;
+        }
+        const maxValue = Math.max(...rows.map((row) => Number(row.gpu_memory_used_mb || 0)), 1);
+        rows.forEach((row, index) => {
+            const side = index % 2 === 0 ? 1 : -1;
+            const slot = Math.floor(index / 2);
+            const x = focusNode.x + side * (106 + slot * 18);
+            const y = focusNode.y - 116 + slot * 54;
+            const value = Number(row.gpu_memory_used_mb || 0);
+            const level = Math.min(value / maxValue, 1);
+            ctx.save();
+            ctx.translate(x - (side < 0 ? 150 : 0), y);
+            ctx.shadowColor = heatColor(level, 0.22);
+            ctx.shadowBlur = 18;
+            ctx.fillStyle = "rgba(251, 252, 255, 0.88)";
+            ctx.strokeStyle = heatColor(level, 0.48);
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            ctx.roundRect(0, 0, 150, 42, 12);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = heatColor(level, 0.84);
+            ctx.beginPath();
+            ctx.roundRect(8, 8, Math.max(24, 82 * level), 5, 999);
+            ctx.fill();
+            ctx.fillStyle = "rgba(31, 39, 69, 0.9)";
+            ctx.font = `700 12px ${font}`;
+            ctx.textAlign = "left";
+            ctx.fillText(`${row.assignee || row.port}`, 8, 24);
+            ctx.fillStyle = "rgba(46, 49, 146, 0.78)";
+            ctx.font = `11px ${font}`;
+            ctx.fillText(`端口 ${row.port} / ${value.toFixed(0)} MB`, 8, 37);
+            ctx.restore();
+        });
+    };
+
+    const draw = (time) => {
+        syncNodes();
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        ctx.clearRect(0, 0, w, h);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, w, h);
+        ctx.clip();
+        const bg = ctx.createLinearGradient(0, 0, w, h);
+        bg.addColorStop(0, "rgba(251,252,255,0.98)");
+        bg.addColorStop(0.58, "rgba(246,249,255,0.92)");
+        bg.addColorStop(1, "rgba(238,245,255,0.82)");
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, w, h);
+        drawSurface(time);
+        drawHub(w, h, time);
+        nodes.forEach((node) => {
+            if (String(node.host.id) !== currentHostId) {
+                drawNode(node, time);
+            }
+        });
+        const focusNode = nodes.get(currentHostId);
+        if (focusNode) {
+            drawSoftLine(hub.x, hub.y + 18, focusNode.x, focusNode.y, 0.82);
+            drawNode(focusNode, time);
+            drawHeatCards();
+        }
+        const fadeWidth = Math.min(150, w * 0.15);
+        const rightFade = ctx.createLinearGradient(w - fadeWidth, 0, w, 0);
+        rightFade.addColorStop(0, "rgba(251,252,255,0)");
+        rightFade.addColorStop(1, "rgba(251,252,255,0.94)");
+        ctx.fillStyle = rightFade;
+        ctx.fillRect(w - fadeWidth, 0, fadeWidth, h);
+        ctx.restore();
+        requestAnimationFrame(draw);
+    };
+
+    const refreshVisual = async () => {
+        try {
+            const response = await fetch("/compute-visual/data", {
+                headers: {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+            });
+            const next = await response.json();
+            if (response.ok && next.ok) {
+                payload = next;
+            }
+        } catch (error) {
+            // Decoration only: keep last frame.
+        }
+    };
+
+    window.updateHostVisualHeatRows = (rows) => {
+        if (Array.isArray(rows)) {
+            heatRows = rows;
+        }
+    };
+
+    resize();
+    syncNodes();
+    requestAnimationFrame(draw);
+    window.addEventListener("resize", resize);
+    canvas.addEventListener("mousemove", (event) => {
+        const point = pointerPosition(event);
+        hoveredNode = hitTestNode(point.x, point.y);
+        const onHub = hub.hitBox && point.x >= hub.hitBox.x && point.x <= hub.hitBox.x + hub.hitBox.width && point.y >= hub.hitBox.y && point.y <= hub.hitBox.y + hub.hitBox.height;
+        const canOpenHost = hoveredNode && hoveredNode.host && hoveredNode.host.allowed !== false;
+        canvas.classList.toggle("is-clickable", Boolean(canOpenHost) || onHub);
+        canvas.title = onHub
+            ? "返回总览"
+            : canOpenHost
+                ? (isUserView ? `进入 ${hoveredNode.host.name} 状态页面` : `进入 ${hoveredNode.host.name} 宿主机管理页面`)
+                : "";
+    });
+    canvas.addEventListener("mouseleave", () => {
+        hoveredNode = null;
+        canvas.classList.remove("is-clickable");
+        canvas.title = "";
+    });
+    canvas.addEventListener("click", (event) => {
+        const point = pointerPosition(event);
+        if (hub.hitBox && point.x >= hub.hitBox.x && point.x <= hub.hitBox.x + hub.hitBox.width && point.y >= hub.hitBox.y && point.y <= hub.hitBox.y + hub.hitBox.height) {
+            window.location.href = "/";
+            return;
+        }
+        const node = hitTestNode(point.x, point.y);
+        if (node && node.host && node.host.id && node.host.allowed !== false && String(node.host.id) !== currentHostId) {
+            window.location.href = `/hosts/${node.host.id}`;
+        }
+    });
+    window.setInterval(refreshVisual, 10000);
+})();
+
 (() => {
     let resourceChartRows = {{ resource_chart_rows | tojson }};
     const resourceSortKey = document.getElementById("resource-sort-key");
@@ -498,6 +1006,8 @@
     const resourceChart = document.getElementById("resource-chart");
     const resourceChartEmpty = document.getElementById("resource-chart-empty");
     const resourceMonitorState = document.getElementById("resource-monitor-state");
+    const hostRefreshState = document.getElementById("host-refresh-state");
+    const hostLastStatusAt = document.getElementById("host-last-status-at");
     const form = document.getElementById("allocation-form");
     const toast = document.getElementById("toast");
     const toastBody = document.getElementById("toast-body");
@@ -533,7 +1043,7 @@
     const feedbackLog = document.getElementById("feedback-log");
     const feedbackCopyLog = document.getElementById("feedback-copy-log");
     const feedbackClose = document.getElementById("feedback-close");
-    if (!form || !toast || !toastBody) {
+    if (!toast || !toastBody) {
         return;
     }
 
@@ -692,6 +1202,9 @@
         if (resourceMonitorState) {
             resourceMonitorState.textContent = "实时监控刷新中...";
         }
+        if (hostRefreshState) {
+            hostRefreshState.textContent = "正在调取宿主机最新状态...";
+        }
         try {
             const response = await fetch(`/hosts/{{ host.id }}/metrics`, {
                 headers: {
@@ -703,32 +1216,67 @@
                 ok: false,
                 message: `监控返回异常，状态码 ${response.status}`
             }));
+            if (!payload.ok && payload.message === "监控状态正在初始化，请稍候。") {
+                if (resourceMonitorState) {
+                    resourceMonitorState.textContent = payload.message;
+                }
+                if (hostRefreshState) {
+                    hostRefreshState.textContent = payload.message;
+                }
+                if (hostLastStatusAt && payload.last_status_at) {
+                    hostLastStatusAt.textContent = payload.last_status_at;
+                }
+                return;
+            }
             if (response.ok && payload.ok) {
                 mergeMetricRows(payload.rows || []);
                 renderResourceChart();
+                if (window.updateHostVisualHeatRows) {
+                    window.updateHostVisualHeatRows(resourceChartRows);
+                }
                 if (resourceMonitorState) {
-                    resourceMonitorState.textContent = `实时监控已更新 ${payload.updated_at || ""}`;
+                    resourceMonitorState.textContent = payload.refresh_in_progress
+                        ? `后台刷新中，当前展示稳定缓存 ${payload.updated_at || ""}`
+                        : `实时监控已更新 ${payload.updated_at || ""}`;
+                }
+                if (hostRefreshState) {
+                    hostRefreshState.textContent = payload.refresh_in_progress
+                        ? "后台刷新中，当前展示稳定缓存"
+                        : "后台状态已更新";
+                }
+                if (hostLastStatusAt && payload.last_status_at) {
+                    hostLastStatusAt.textContent = payload.last_status_at;
                 }
             } else if (resourceMonitorState) {
                 resourceMonitorState.textContent = payload.message || "实时监控刷新失败";
+                if (hostRefreshState) {
+                    hostRefreshState.textContent = payload.message || "后台刷新失败，继续显示最后缓存状态";
+                }
+                if (hostLastStatusAt && payload.last_status_at) {
+                    hostLastStatusAt.textContent = payload.last_status_at;
+                }
             }
         } catch (error) {
             if (resourceMonitorState) {
                 resourceMonitorState.textContent = "实时监控暂不可用";
+            }
+            if (hostRefreshState) {
+                hostRefreshState.textContent = "后台刷新暂不可用，继续显示最后缓存状态";
             }
         } finally {
             metricsInFlight = false;
         }
     };
 
-    window.setTimeout(refreshMetrics, 1200);
-    window.setInterval(refreshMetrics, 12000);
+    window.setTimeout(refreshMetrics, 300);
+    window.setInterval(refreshMetrics, 8000);
     document.addEventListener("visibilitychange", () => {
         if (!document.hidden) {
             refreshMetrics();
         }
     });
 
+    {% if not is_user_view %}
     const showToast = (message, type) => {
         toast.classList.remove("hidden", "success", "error");
         toast.classList.add(type);
@@ -739,11 +1287,58 @@
         timer = setTimeout(() => toast.classList.add("hidden"), 3600);
     };
 
+    const resetActionModal = () => {
+        if (!actionModal) {
+            return;
+        }
+        actionModal.classList.add("hidden");
+        actionModal.setAttribute("aria-hidden", "true");
+        pendingAction = null;
+        if (actionConfirm) {
+            actionConfirm.disabled = false;
+        }
+    };
+
+    const resetSnapshotModal = () => {
+        if (!snapshotModal) {
+            return;
+        }
+        snapshotModal.classList.add("hidden");
+        snapshotModal.setAttribute("aria-hidden", "true");
+        snapshotProgressWrap?.classList.add("hidden");
+        if (snapshotProgressFill) {
+            snapshotProgressFill.style.width = "0%";
+        }
+        if (snapshotConfirm) {
+            snapshotConfirm.disabled = false;
+        }
+        if (snapshotCancel) {
+            snapshotCancel.disabled = false;
+        }
+        if (progressTimer) {
+            clearInterval(progressTimer);
+            progressTimer = null;
+        }
+    };
+
+    const resetAccessModal = () => {
+        if (!accessModal) {
+            return;
+        }
+        accessModal.classList.add("hidden");
+        accessModal.setAttribute("aria-hidden", "true");
+    };
+
+    const resetRestartAllModal = () => {
+        restartAllModal?.classList.add("hidden");
+        restartAllModal?.setAttribute("aria-hidden", "true");
+    };
+
     const closeAllModals = () => {
-        closeActionModal();
-        closeSnapshotModal();
-        closeAccessModal();
-        closeRestartAllModal(false);
+        resetActionModal();
+        resetSnapshotModal();
+        resetAccessModal();
+        resetRestartAllModal();
     };
 
     const showFeedbackModal = (message, type = "success", errorLog = "", options = {}) => {
@@ -789,6 +1384,7 @@
         }
     };
 
+    if (form) {
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
         const submitButton = form.querySelector('button[type="submit"]');
@@ -846,6 +1442,7 @@
             }
         }
     });
+    }
 
     const openSnapshotButtons = document.querySelectorAll(".snapshot-open");
     let progressTimer = null;
@@ -856,6 +1453,9 @@
     const snapshotIntervalDaysInput = document.getElementById("snapshot-interval-days");
 
     const openSnapshotModal = (button) => {
+        if (!snapshotModal || !snapshotAllocationId || !snapshotProgressFill) {
+            return;
+        }
         const allocationId = button.dataset.allocationId;
         snapshotAllocationId.value = allocationId;
         if (snapshotKeepCountInput && button.dataset.snapshotKeepCount) {
@@ -866,7 +1466,7 @@
         }
         snapshotModal.classList.remove("hidden");
         snapshotModal.setAttribute("aria-hidden", "false");
-        snapshotProgressWrap.classList.add("hidden");
+        snapshotProgressWrap?.classList.add("hidden");
         snapshotProgressFill.style.width = "0%";
     };
 
@@ -874,25 +1474,22 @@
         if (snapshotInFlight && snapshotController) {
             snapshotController.abort();
             snapshotInFlight = false;
-            showFeedbackModal(
-                "已停止等待快照结果。后端若已进入 docker save，可能仍会继续运行；请稍后刷新查看快照列表。",
-                "error",
-                "前端已取消等待，不再阻塞当前页面。平台不会因此写入新的前端状态。"
-            );
+            feedbackModalTitle.textContent = "操作失败";
+            feedbackModalMessage.textContent = "已停止等待快照结果。后端若已进入 docker save，可能仍会继续运行；请稍后刷新查看快照列表。";
+            feedbackLog.value = "前端已取消等待，不再阻塞当前页面。平台不会因此写入新的前端状态。";
+            feedbackLogWrap.classList.remove("hidden");
+            feedbackCopyLog.classList.remove("hidden");
+            feedbackModal.classList.remove("hidden");
+            feedbackModal.setAttribute("aria-hidden", "false");
+            showToast("已停止等待快照结果。", "error");
         }
-        snapshotModal.classList.add("hidden");
-        snapshotModal.setAttribute("aria-hidden", "true");
-        snapshotProgressWrap.classList.add("hidden");
-        snapshotProgressFill.style.width = "0%";
-        snapshotConfirm.disabled = false;
-        snapshotCancel.disabled = false;
-        if (progressTimer) {
-            clearInterval(progressTimer);
-            progressTimer = null;
-        }
+        resetSnapshotModal();
     };
 
     const openAccessModal = (button) => {
+        if (!accessModal || !accessText) {
+            return;
+        }
         const hostAddress = button.dataset.hostAddress || "{{ host.address }}";
         const hostPort = button.dataset.hostPort || "";
         const rootPassword = button.dataset.rootPassword || "";
@@ -902,11 +1499,13 @@
     };
 
     const closeAccessModal = () => {
-        accessModal.classList.add("hidden");
-        accessModal.setAttribute("aria-hidden", "true");
+        resetAccessModal();
     };
 
     const openActionModal = (button, actionForm) => {
+        if (!actionModal || !actionModalTitle || !actionModalMessage || !actionConfirm) {
+            return;
+        }
         pendingAction = { button, actionForm };
         const actionLabel = button.dataset.actionLabel || "执行";
         const assignee = button.dataset.assignee || "该用户";
@@ -919,10 +1518,7 @@
     };
 
     const closeActionModal = () => {
-        actionModal.classList.add("hidden");
-        actionModal.setAttribute("aria-hidden", "true");
-        pendingAction = null;
-        actionConfirm.disabled = false;
+        resetActionModal();
     };
 
     const appendRestartAllLog = (line) => {
@@ -944,6 +1540,9 @@
     };
 
     const openRestartAllModal = () => {
+        if (!restartAllModal || !restartAllMessage || !restartAllLog || !restartAllConfirm || !restartAllCancel) {
+            return;
+        }
         restartAllModal?.classList.remove("hidden");
         restartAllModal?.setAttribute("aria-hidden", "false");
         restartAllMessage.textContent = "将逐个重启当前宿主机端口池内所有容器。";
@@ -966,8 +1565,7 @@
                 "前端已停止等待。已提交给 Docker 的单个 restart 命令可能仍会执行完成。"
             );
         }
-        restartAllModal?.classList.add("hidden");
-        restartAllModal?.setAttribute("aria-hidden", "true");
+        resetRestartAllModal();
     };
 
     openSnapshotButtons.forEach((button) => {
@@ -1000,6 +1598,9 @@
     restartAllCancel?.addEventListener("click", () => closeRestartAllModal(true));
 
     restartAllConfirm?.addEventListener("click", async () => {
+        if (!restartAllConfirm || !restartAllCancel || !restartAllMessage) {
+            return;
+        }
         if (restartAllInFlight) {
             return;
         }
@@ -1386,6 +1987,7 @@
             }
         });
     }
+    {% endif %}
 })();
 </script>
 
