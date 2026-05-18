@@ -38,6 +38,29 @@ def parse_mounts(raw_mounts: str | None) -> list[str]:
     return mounts
 
 
+def parse_docker_size_to_gb(value: str | None) -> float:
+    text = (value or "").strip()
+    if not text:
+        return 0.0
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)", text, re.IGNORECASE)
+    if not match:
+        return 0.0
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    factors = {
+        "b": 1 / (1024**3),
+        "kb": 1 / (1000**2),
+        "kib": 1 / (1024**2),
+        "mb": 1 / 1000,
+        "mib": 1 / 1024,
+        "gb": 1.0,
+        "gib": 1.0,
+        "tb": 1000.0,
+        "tib": 1024.0,
+    }
+    return number * factors.get(unit, 0.0)
+
+
 def _container_host_ports(detail: dict) -> set[int]:
     ports: set[int] = set()
     port_bindings = detail.get("HostConfig", {}).get("PortBindings", {}) or {}
@@ -185,6 +208,26 @@ class DockerService:
         raw = self._run("docker ps -a --format '{{json .}}'")
         return parse_json_lines(raw)
 
+    def container_disk_usage_gb_map(self, timeout: int = 120) -> dict[str, dict[str, float | str]]:
+        raw = self._run("docker ps -a --size --format '{{json .}}'", timeout=timeout)
+        usage_by_name: dict[str, dict[str, float | str]] = {}
+        for row in parse_json_lines(raw):
+            name = (row.get("Names") or row.get("Name") or "").strip().lstrip("/")
+            if not name:
+                continue
+            size_text = (row.get("Size") or "").strip()
+            writable_text = size_text.split("(", 1)[0].strip()
+            virtual_text = ""
+            virtual_match = re.search(r"virtual\s+([^)]+)", size_text, re.IGNORECASE)
+            if virtual_match:
+                virtual_text = virtual_match.group(1).strip()
+            usage_by_name[name] = {
+                "disk_used_gb": parse_docker_size_to_gb(writable_text),
+                "disk_virtual_gb": parse_docker_size_to_gb(virtual_text),
+                "disk_size_text": size_text,
+            }
+        return usage_by_name
+
     def list_images(self) -> list[str]:
         raw = self._run("docker images --format '{{.Repository}}:{{.Tag}}'")
         images: list[str] = []
@@ -307,10 +350,10 @@ class DockerService:
         raw = self._run("docker stats --no-stream --format '{{json .}}'", timeout=timeout)
         return parse_json_lines(raw)
 
-    def container_id_name_map(self) -> dict[str, str]:
+    def container_id_name_map(self, timeout: int = 120) -> dict[str, str]:
         raw = self.runner.run(
             "docker ps -q --no-trunc | xargs -r docker inspect --format '{{.Id}} {{.Name}}'",
-            timeout=120,
+            timeout=timeout,
         )
         if not raw.ok or not raw.stdout.strip():
             return {}
@@ -350,10 +393,18 @@ class DockerService:
             )
         return records
 
-    def gpu_memory_by_container(self) -> dict[str, float]:
+    def gpu_memory_by_container(self, timeout: int = 120) -> dict[str, float]:
+        detail_by_container = self.gpu_memory_detail_by_container(timeout=timeout)
+        return {
+            container_name: sum(float(item.get("used_memory_mb") or 0.0) for item in items)
+            for container_name, items in detail_by_container.items()
+        }
+
+    def gpu_memory_detail_by_container(self, timeout: int = 120) -> dict[str, list[dict]]:
         try:
             raw = self._run(
-                "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits"
+                "nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits",
+                timeout=timeout,
             )
         except RunnerError:
             return {}
@@ -361,22 +412,36 @@ class DockerService:
         if not raw.strip():
             return {}
 
-        id_to_name = self.container_id_name_map()
+        gpu_index_by_uuid: dict[str, str] = {}
+        try:
+            gpu_raw = self._run(
+                "nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits",
+                timeout=timeout,
+            )
+            for line in gpu_raw.splitlines():
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) >= 2:
+                    gpu_index_by_uuid[parts[1]] = parts[0]
+        except RunnerError:
+            gpu_index_by_uuid = {}
+
+        id_to_name = self.container_id_name_map(timeout=timeout)
         if not id_to_name:
             return {}
 
-        usage_by_container: dict[str, float] = {}
+        usage_by_container_gpu: dict[str, dict[str, float]] = {}
         for line in raw.splitlines():
             parts = [part.strip() for part in line.split(",")]
-            if len(parts) < 2:
+            if len(parts) < 3:
                 continue
             try:
                 pid = int(parts[0])
-                used_memory_mb = float(parts[1] or 0)
+                gpu_uuid = parts[1]
+                used_memory_mb = float(parts[2] or 0)
             except ValueError:
                 continue
 
-            cgroup_result = self.runner.run(f"cat /proc/{pid}/cgroup", timeout=15)
+            cgroup_result = self.runner.run(f"cat /proc/{pid}/cgroup", timeout=min(timeout, 15))
             if not cgroup_result.ok or not cgroup_result.stdout.strip():
                 continue
 
@@ -406,9 +471,23 @@ class DockerService:
             container_name = id_to_name.get(container_id)
             if not container_name:
                 continue
-            usage_by_container[container_name] = usage_by_container.get(container_name, 0.0) + used_memory_mb
+            gpu_index = gpu_index_by_uuid.get(gpu_uuid, gpu_uuid)
+            container_usage = usage_by_container_gpu.setdefault(container_name, {})
+            container_usage[gpu_index] = container_usage.get(gpu_index, 0.0) + used_memory_mb
 
-        return usage_by_container
+        return {
+            container_name: [
+                {
+                    "gpu_index": gpu_index,
+                    "used_memory_mb": round(used_memory_mb, 2),
+                }
+                for gpu_index, used_memory_mb in sorted(
+                    gpu_usage.items(),
+                    key=lambda item: int(item[0]) if str(item[0]).isdigit() else str(item[0]),
+                )
+            ]
+            for container_name, gpu_usage in usage_by_container_gpu.items()
+        }
 
     def workspace_usage_gb_map(self, allocations: list[Allocation]) -> dict[str, float]:
         if not allocations:
@@ -684,6 +763,24 @@ fi
                 stderr=result.stderr,
                 stdout=result.stdout,
             )
+        return AllocationStatus.RUNNING.value
+
+    def restart_container_by_name(self, container_name: str, logs: list[str] | None = None) -> str:
+        command = f"docker restart {shlex.quote(container_name)}"
+        self._log(logs, f"重启容器 {container_name}")
+        result = self.runner.run(command, timeout=900)
+        if not result.ok:
+            exists, runtime_status = self.inspect_container_runtime(container_name)
+            if not exists:
+                return AllocationStatus.DELETED.value
+            raise RunnerError(
+                result.stderr or result.stdout or f"Command failed: {command}",
+                command=command,
+                exit_code=result.exit_code,
+                stderr=result.stderr,
+                stdout=result.stdout,
+            )
+        self._log(logs, f"容器 {container_name} 已重启")
         return AllocationStatus.RUNNING.value
 
     def remove_container(self, allocation: Allocation, logs: list[str] | None = None) -> None:

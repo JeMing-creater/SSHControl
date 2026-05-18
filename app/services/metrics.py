@@ -40,13 +40,19 @@ def parse_memory_usage(value: str) -> float:
         return 0.0
 
 
-def host_summary(db: Session, host: ManagedHost, timeout: int = 120, include_heavy: bool = True) -> dict:
+def host_summary(
+    db: Session,
+    host: ManagedHost,
+    timeout: int = 120,
+    include_heavy: bool = True,
+    include_gpus: bool = True,
+) -> dict:
     try:
         docker = DockerService(host)
         reachable = docker.ping(timeout=timeout)
         docker_info = docker.docker_info(timeout=timeout) if reachable else {}
         stats = docker.list_container_stats(timeout=timeout) if reachable and include_heavy else []
-        gpus = docker.gpu_stats(timeout=timeout) if reachable and include_heavy else []
+        gpus = docker.gpu_stats(timeout=timeout) if reachable and include_gpus else []
         actual_container_names = (
             {
                 item["container_name"]

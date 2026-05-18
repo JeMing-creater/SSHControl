@@ -203,6 +203,7 @@
         testButton.disabled = true;
         submitButton.disabled = true;
         result.innerHTML = '<p class="muted">正在检测 SSH 与 Docker，请稍候...</p>';
+        window.showGlobalBusy?.("正在检测 SSH 与 Docker 环境...");
 
         try {
             const response = await fetch("/setup/test", {
@@ -244,6 +245,7 @@
             `;
             showFeedbackModal("检测请求发送失败，请检查网络或后端状态。", "error", String(error));
         } finally {
+            window.hideGlobalBusy?.();
             testButton.disabled = false;
         }
     });

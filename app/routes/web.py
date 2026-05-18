@@ -94,6 +94,69 @@ def ssh_host_count(db: Session) -> int:
     )
 
 
+def compute_visual_payload(db: Session) -> dict:
+    hosts = db.query(ManagedHost).filter(ManagedHost.enabled == True).order_by(ManagedHost.name.asc()).all()  # noqa: E712
+    rows = []
+    total_gpu_used_mb = 0.0
+    total_gpu_memory_mb = 0.0
+    total_containers = 0
+    for host in hosts:
+        active_allocations = (
+            db.query(Allocation)
+            .filter(
+                Allocation.host_id == host.id,
+                Allocation.status.in_(
+                    [
+                        AllocationStatus.PENDING.value,
+                        AllocationStatus.RUNNING.value,
+                        AllocationStatus.STOPPED.value,
+                    ]
+                ),
+            )
+            .all()
+        )
+        running_count = sum(1 for allocation in active_allocations if allocation.status == AllocationStatus.RUNNING.value)
+        container_count = len(active_allocations)
+        total_containers += container_count
+        gpus = []
+        try:
+            gpus = DockerService(host).gpu_stats(timeout=5)
+        except Exception:
+            gpus = []
+        gpu_used_mb = sum(float(gpu.get("memory_used_mb") or 0.0) for gpu in gpus)
+        gpu_total_mb = sum(float(gpu.get("memory_total_mb") or 0.0) for gpu in gpus)
+        gpu_percent = (gpu_used_mb / gpu_total_mb * 100) if gpu_total_mb else 0.0
+        total_gpu_used_mb += gpu_used_mb
+        total_gpu_memory_mb += gpu_total_mb
+        rows.append(
+            {
+                "id": host.id,
+                "name": host.name,
+                "address": host.address,
+                "container_count": container_count,
+                "running_count": running_count,
+                "gpu_count": len(gpus),
+                "gpu_used_mb": round(gpu_used_mb, 2),
+                "gpu_total_mb": round(gpu_total_mb, 2),
+                "gpu_percent": round(gpu_percent, 2),
+                "load": gpu_percent,
+            }
+        )
+    overall_gpu_percent = (total_gpu_used_mb / total_gpu_memory_mb * 100) if total_gpu_memory_mb else 0.0
+    for row in rows:
+        row["intensity"] = round(float(row["gpu_percent"] or 0.0) / 100, 3)
+    return {
+        "ok": True,
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "host_count": len(rows),
+        "overall_gpu_percent": round(overall_gpu_percent, 2),
+        "total_gpu_used_mb": round(total_gpu_used_mb, 2),
+        "total_gpu_memory_mb": round(total_gpu_memory_mb, 2),
+        "total_containers": total_containers,
+        "hosts": rows,
+    }
+
+
 def build_ssh_host(
     *,
     name: str,
@@ -329,7 +392,7 @@ def dashboard(request: Request):
         allocations = db.query(Allocation).order_by(Allocation.created_at.desc()).limit(20).all()
         host_cards = []
         for host in hosts:
-            summary = host_summary(db, host, timeout=5, include_heavy=False)
+            summary = host_summary(db, host, timeout=5, include_heavy=False, include_gpus=True)
             total_cpu = float(summary["docker_info"].get("NCPU") or 0)
             total_memory_gb = float(summary["docker_info"].get("MemTotal") or 0) / (1024**3)
             host_cards.append(
@@ -347,8 +410,18 @@ def dashboard(request: Request):
                 "settings": settings,
                 "host_cards": host_cards,
                 "allocations": allocations,
+                "visual": compute_visual_payload(db),
             },
         )
+    finally:
+        db.close()
+
+
+@router.get("/compute-visual/data")
+def compute_visual_data():
+    db: Session = SessionLocal()
+    try:
+        return JSONResponse(compute_visual_payload(db))
     finally:
         db.close()
 
@@ -362,7 +435,7 @@ def hosts_page(request: Request):
         hosts = db.query(ManagedHost).order_by(ManagedHost.name.asc()).all()
         host_rows = []
         for host in hosts:
-            summary = host_summary(db, host, timeout=5, include_heavy=False)
+            summary = host_summary(db, host, timeout=5, include_heavy=False, include_gpus=True)
             defaults = recommended_defaults(host, summary["docker_info"])
             host_rows.append({"host": host, "summary": summary, "defaults": defaults})
         return render(
@@ -753,12 +826,8 @@ def host_detail(request: Request, host_id: int):
         allocation_by_host_port = {
             allocation.host_port: allocation for allocation in db_allocations
         }
-        gpu_usage_by_name = docker.gpu_memory_by_container() if docker and reachable else {}
-        workspace_usage_by_name = (
-            docker.workspace_usage_gb_map(list(allocation_by_container_name.values()))
-            if docker and reachable
-            else {}
-        )
+        gpu_detail_by_name = docker.gpu_memory_detail_by_container() if docker and reachable else {}
+        disk_usage_by_name = docker.container_disk_usage_gb_map() if docker and reachable else {}
         allocation_rows = []
         unified_container_rows = []
         resource_chart_rows = []
@@ -770,8 +839,12 @@ def host_detail(request: Request, host_id: int):
             stats = stats_by_name.get(container_row["container_name"], {})
             cpu_percent = parse_percent(stats.get("CPUPerc", ""))
             memory_used_gb = parse_memory_usage(stats.get("MemUsage", ""))
-            gpu_memory_used_mb = float(gpu_usage_by_name.get(container_row["container_name"], 0.0))
-            workspace_used_gb = float(workspace_usage_by_name.get(container_row["container_name"], 0.0))
+            gpu_memory_detail = gpu_detail_by_name.get(container_row["container_name"], [])
+            gpu_memory_used_mb = sum(float(item.get("used_memory_mb") or 0.0) for item in gpu_memory_detail)
+            disk_usage = disk_usage_by_name.get(container_row["container_name"], {})
+            disk_used_gb = float(disk_usage.get("disk_used_gb") or 0.0)
+            disk_virtual_gb = float(disk_usage.get("disk_virtual_gb") or 0.0)
+            disk_size_text = str(disk_usage.get("disk_size_text") or "")
 
             if allocation:
                 visible_ports.add(allocation.host_port)
@@ -792,7 +865,10 @@ def host_detail(request: Request, host_id: int):
                         "cpu_percent": cpu_percent,
                         "memory_used_gb": memory_used_gb,
                         "gpu_memory_used_mb": gpu_memory_used_mb,
-                        "workspace_used_gb": workspace_used_gb,
+                        "gpu_memory_detail": gpu_memory_detail,
+                        "disk_used_gb": disk_used_gb,
+                        "disk_virtual_gb": disk_virtual_gb,
+                        "disk_size_text": disk_size_text,
                         "effective_snapshot_keep_count": snapshot_keep_count,
                         "effective_snapshot_interval_days": snapshot_interval_days,
                     }
@@ -806,7 +882,9 @@ def host_detail(request: Request, host_id: int):
                         "cpu_percent": round(cpu_percent, 2),
                         "memory_used_gb": round(memory_used_gb, 2),
                         "gpu_memory_used_mb": round(gpu_memory_used_mb, 2),
-                        "workspace_used_gb": round(workspace_used_gb, 2),
+                        "gpu_memory_detail": gpu_memory_detail,
+                        "disk_used_gb": round(disk_used_gb, 2),
+                        "disk_virtual_gb": round(disk_virtual_gb, 2),
                         "cpu_limit_cores": round(float(allocation.cpu_limit_cores or 0.0), 2),
                         "memory_limit_gb": round(float(allocation.memory_limit_gb or 0.0), 2),
                         "workspace_limit_gb": round(float(allocation.workspace_limit_gb or 0.0), 2),
@@ -826,7 +904,10 @@ def host_detail(request: Request, host_id: int):
                     "cpu_percent": cpu_percent,
                     "memory_used_gb": memory_used_gb,
                     "gpu_memory_used_mb": gpu_memory_used_mb,
-                    "workspace_used_gb": workspace_used_gb,
+                    "gpu_memory_detail": gpu_memory_detail,
+                    "disk_used_gb": disk_used_gb,
+                    "disk_virtual_gb": disk_virtual_gb,
+                    "disk_size_text": disk_size_text,
                     "allocation": None,
                     "stats": stats,
                     "effective_snapshot_keep_count": host.snapshot_keep_count,
@@ -843,7 +924,9 @@ def host_detail(request: Request, host_id: int):
                     "cpu_percent": round(cpu_percent, 2),
                     "memory_used_gb": round(memory_used_gb, 2),
                     "gpu_memory_used_mb": round(gpu_memory_used_mb, 2),
-                    "workspace_used_gb": round(workspace_used_gb, 2),
+                    "gpu_memory_detail": gpu_memory_detail,
+                    "disk_used_gb": round(disk_used_gb, 2),
+                    "disk_virtual_gb": round(disk_virtual_gb, 2),
                     "cpu_limit_cores": 0.0,
                     "memory_limit_gb": 0.0,
                     "workspace_limit_gb": 0.0,
@@ -885,6 +968,92 @@ def host_detail(request: Request, host_id: int):
                 "resource_chart_rows": resource_chart_rows,
                 "docker_error": docker_error,
             },
+        )
+    finally:
+        db.close()
+
+
+@router.get("/hosts/{host_id}/metrics")
+def host_metrics(host_id: int):
+    db: Session = SessionLocal()
+    try:
+        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        if not host:
+            return JSONResponse(
+                {"ok": False, "message": "未找到宿主机记录。", "error_log": f"host_id={host_id}"},
+                status_code=404,
+            )
+
+        try:
+            docker = DockerService(host)
+            reachable = docker.ping(timeout=4)
+            container_rows = (
+                docker.managed_container_rows(host.port_start, host.port_end, timeout=6)
+                if reachable
+                else []
+            )
+            stats_list = docker.list_container_stats(timeout=6) if reachable else []
+            gpus = docker.gpu_stats(timeout=4) if reachable else []
+            gpu_detail_by_name = docker.gpu_memory_detail_by_container(timeout=6) if reachable else {}
+            disk_usage_by_name = docker.container_disk_usage_gb_map(timeout=6) if reachable else {}
+        except RunnerError as exc:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "message": "实时监控刷新失败。",
+                    "error_log": exc.log_text() or str(exc),
+                },
+                status_code=200,
+            )
+
+        db_allocations = (
+            db.query(Allocation)
+            .filter(Allocation.host_id == host.id)
+            .all()
+        )
+        allocation_by_container_name = {
+            allocation.container_name: allocation for allocation in db_allocations
+        }
+        allocation_by_host_port = {
+            allocation.host_port: allocation for allocation in db_allocations
+        }
+        stats_by_name = {item.get("Name"): item for item in stats_list}
+        rows = []
+        for container_row in container_rows:
+            allocation = allocation_by_container_name.get(
+                container_row["container_name"]
+            ) or allocation_by_host_port.get(container_row["host_port"])
+            stats = stats_by_name.get(container_row["container_name"], {})
+            disk_usage = disk_usage_by_name.get(container_row["container_name"], {})
+            gpu_memory_detail = gpu_detail_by_name.get(container_row["container_name"], [])
+            gpu_memory_used_mb = sum(float(item.get("used_memory_mb") or 0.0) for item in gpu_memory_detail)
+            rows.append(
+                {
+                    "registered": bool(allocation),
+                    "container_name": container_row["container_name"],
+                    "port": allocation.host_port if allocation else container_row["host_port"],
+                    "assignee": allocation.assignee if allocation else container_row["container_name"],
+                    "status": container_row["status"],
+                    "cpu_percent": round(parse_percent(stats.get("CPUPerc", "")), 2),
+                    "memory_used_gb": round(parse_memory_usage(stats.get("MemUsage", "")), 2),
+                    "gpu_memory_used_mb": round(gpu_memory_used_mb, 2),
+                    "gpu_memory_detail": gpu_memory_detail,
+                    "disk_used_gb": round(float(disk_usage.get("disk_used_gb") or 0.0), 2),
+                    "disk_virtual_gb": round(float(disk_usage.get("disk_virtual_gb") or 0.0), 2),
+                    "cpu_limit_cores": round(float(allocation.cpu_limit_cores or 0.0), 2) if allocation else 0.0,
+                    "memory_limit_gb": round(float(allocation.memory_limit_gb or 0.0), 2) if allocation else 0.0,
+                    "workspace_limit_gb": round(float(allocation.workspace_limit_gb or 0.0), 2) if allocation else 0.0,
+                }
+            )
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "reachable": reachable,
+                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "rows": rows,
+                "gpus": gpus,
+            }
         )
     finally:
         db.close()
@@ -1322,6 +1491,106 @@ def external_container_action(
         return RedirectResponse(f"/hosts/{host_id}?error={reason}", status_code=303)
     finally:
         db.close()
+
+
+@router.post("/hosts/{host_id}/containers/restart-all/stream")
+def restart_all_host_containers_stream(request: Request, host_id: int):
+    def generate():
+        db: Session = SessionLocal()
+        try:
+            host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+            if not host:
+                yield stream_event("error", ok=False, message="未找到宿主机记录。", error_log=f"host_id={host_id}")
+                return
+
+            docker = DockerService(host)
+            yield stream_event("log", message=f"开始读取宿主机 {host.name} 的端口容器")
+            container_rows = docker.managed_container_rows(host.port_start, host.port_end, timeout=120)
+            restart_rows = [
+                row for row in container_rows
+                if row.get("status") != AllocationStatus.DELETED.value
+            ]
+            total = len(restart_rows)
+            if total == 0:
+                yield stream_event("done", ok=True, message="当前宿主机没有需要重启的端口容器。", completed=0, total=0, progress=100)
+                return
+
+            yield stream_event("progress", message=f"发现 {total} 个容器，准备逐个重启。", completed=0, total=total, progress=0)
+            allocation_by_name = {
+                allocation.container_name: allocation
+                for allocation in db.query(Allocation)
+                .filter(
+                    Allocation.host_id == host.id,
+                    Allocation.status != AllocationStatus.DELETED.value,
+                )
+                .all()
+            }
+
+            failures: list[str] = []
+            for index, row in enumerate(restart_rows, start=1):
+                container_name = row["container_name"]
+                host_port = row["host_port"]
+                yield stream_event("log", message=f"[{index}/{total}] 重启端口 {host_port} 容器 {container_name}")
+                try:
+                    runtime_status = docker.restart_container_by_name(container_name)
+                    allocation = allocation_by_name.get(container_name)
+                    if allocation:
+                        allocation.status = runtime_status
+                        db.commit()
+                    progress = int(index * 100 / total)
+                    yield stream_event(
+                        "progress",
+                        message=f"端口 {host_port} 已重启。",
+                        completed=index,
+                        total=total,
+                        progress=progress,
+                    )
+                except RunnerError as exc:
+                    db.rollback()
+                    error_log = exc.log_text() or str(exc)
+                    failures.append(f"端口 {host_port} ({container_name})：{error_log}")
+                    yield stream_event(
+                        "log",
+                        message=f"端口 {host_port} 重启失败，继续尝试后续容器。",
+                    )
+
+            if failures:
+                error_log = "\n\n".join(failures)
+                yield stream_event(
+                    "error",
+                    ok=False,
+                    message=f"批量重启完成，但 {len(failures)} 个容器失败。",
+                    error_log=error_log,
+                    completed=total - len(failures),
+                    total=total,
+                    progress=100,
+                )
+                return
+
+            yield stream_event(
+                "done",
+                ok=True,
+                message=f"已重启 {total} 个端口容器。",
+                completed=total,
+                total=total,
+                progress=100,
+            )
+        except RunnerError as exc:
+            db.rollback()
+            summary, error_log = runner_error_payload(exc, "批量重启失败。")
+            yield stream_event("error", ok=False, message=summary, error_log=error_log)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            reason = str(exc).strip()
+            yield stream_event("error", ok=False, message=reason, error_log=reason)
+        except Exception as exc:
+            db.rollback()
+            reason = f"{type(exc).__name__}: {exc}"
+            yield stream_event("error", ok=False, message="批量重启失败。", error_log=reason)
+        finally:
+            db.close()
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @router.post("/allocations/{allocation_id}/snapshot")

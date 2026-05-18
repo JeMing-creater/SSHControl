@@ -99,6 +99,33 @@
         </div>
     </div>
 </section>
+<section id="restart-all-modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop"></div>
+    <div class="modal-card">
+        <div class="panel-head">
+            <div>
+                <p class="eyebrow">批量重启</p>
+                <h3>重启全部端口容器</h3>
+            </div>
+        </div>
+        <div class="form-grid">
+            <p id="restart-all-message" class="wide muted">将逐个重启当前宿主机端口池内所有容器。</p>
+            <div class="wide progress-wrap">
+                <div class="progress-label" id="restart-all-progress-label">等待开始</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="restart-all-progress-fill"></div>
+                </div>
+            </div>
+            <label id="restart-all-log-wrap" class="wide hidden">执行日志
+                <textarea id="restart-all-log" rows="9" readonly></textarea>
+            </label>
+            <div class="wide modal-actions">
+                <button class="button secondary" type="button" id="restart-all-cancel">取消</button>
+                <button class="button danger" type="button" id="restart-all-confirm">开始重启</button>
+            </div>
+        </div>
+    </div>
+</section>
 <section id="feedback-modal" class="modal hidden" aria-hidden="true">
     <div class="modal-backdrop"></div>
     <div class="modal-card">
@@ -245,7 +272,8 @@
         <div>
             <p class="eyebrow">资源排行榜</p>
             <h3>按端口查看实时占用排序</h3>
-            <p class="muted">可切换 CPU、内存、显卡显存和 workspace 占用，快速定位最重的端口。</p>
+            <p class="muted">可切换 CPU、内存、显卡显存和 Docker 磁盘占用，快速定位最重的端口。</p>
+            <p id="resource-monitor-state" class="monitor-state">实时监控准备中</p>
         </div>
         <div class="chart-toolbar">
             <label>排序维度
@@ -272,6 +300,7 @@
             <h3>全部端口容器</h3>
             <p class="muted">登记容器支持资源、挂载、快照和连接信息维护；未登记容器仅支持启动、停止、删除。</p>
         </div>
+        <button class="button danger" type="button" id="restart-all-open">一键重启所有镜像</button>
     </div>
     <table class="table">
         <thead>
@@ -342,7 +371,14 @@
                     <div>CPU {{ "%.1f"|format(row.cpu_percent) }}%</div>
                     <div>内存 {{ "%.1f"|format(row.memory_used_gb) }} GB</div>
                     <div>显存 {{ "%.0f"|format(row.gpu_memory_used_mb) }} MB</div>
-                    <div>workspace {{ "%.1f"|format(row.workspace_used_gb) }} GB</div>
+                    {% if row.gpu_memory_detail %}
+                    <div class="muted">
+                        {% for gpu_item in row.gpu_memory_detail %}
+                        GPU {{ gpu_item.gpu_index }}: {{ "%.0f"|format(gpu_item.used_memory_mb) }} MB{% if not loop.last %} / {% endif %}
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                    <div>Docker 磁盘 {{ "%.1f"|format(row.disk_used_gb) }} GB</div>
                 </td>
                 <td>
                     {% if row.registered %}
@@ -456,11 +492,12 @@
 
 <script>
 (() => {
-    const resourceChartRows = {{ resource_chart_rows | tojson }};
+    let resourceChartRows = {{ resource_chart_rows | tojson }};
     const resourceSortKey = document.getElementById("resource-sort-key");
     const resourceToggle = document.getElementById("resource-toggle");
     const resourceChart = document.getElementById("resource-chart");
     const resourceChartEmpty = document.getElementById("resource-chart-empty");
+    const resourceMonitorState = document.getElementById("resource-monitor-state");
     const form = document.getElementById("allocation-form");
     const toast = document.getElementById("toast");
     const toastBody = document.getElementById("toast-body");
@@ -480,6 +517,15 @@
     const actionModalMessage = document.getElementById("action-modal-message");
     const actionCancel = document.getElementById("action-cancel");
     const actionConfirm = document.getElementById("action-confirm");
+    const restartAllOpen = document.getElementById("restart-all-open");
+    const restartAllModal = document.getElementById("restart-all-modal");
+    const restartAllMessage = document.getElementById("restart-all-message");
+    const restartAllProgressLabel = document.getElementById("restart-all-progress-label");
+    const restartAllProgressFill = document.getElementById("restart-all-progress-fill");
+    const restartAllLogWrap = document.getElementById("restart-all-log-wrap");
+    const restartAllLog = document.getElementById("restart-all-log");
+    const restartAllCancel = document.getElementById("restart-all-cancel");
+    const restartAllConfirm = document.getElementById("restart-all-confirm");
     const feedbackModal = document.getElementById("feedback-modal");
     const feedbackModalTitle = document.getElementById("feedback-modal-title");
     const feedbackModalMessage = document.getElementById("feedback-modal-message");
@@ -495,6 +541,9 @@
     let pendingAction = null;
     let pendingReload = false;
     let resourceExpanded = false;
+    let metricsInFlight = false;
+    let restartAllInFlight = false;
+    let restartAllController = null;
 
     const chartMeta = {
         cpu: {
@@ -517,16 +566,16 @@
             label: "显存占用",
             unit: "MB",
             valueKey: "gpu_memory_used_mb",
-            limitKey: null,
-            limitLabel: "",
+            limitKey: "gpu_memory_detail",
+            limitLabel: "显卡明细",
             colorClass: "gpu"
         },
         disk: {
-            label: "workspace 占用",
+            label: "Docker 磁盘占用",
             unit: "GB",
-            valueKey: "workspace_used_gb",
-            limitKey: "workspace_limit_gb",
-            limitLabel: "workspace 上限",
+            valueKey: "disk_used_gb",
+            limitKey: null,
+            limitLabel: "",
             colorClass: "disk"
         }
     };
@@ -540,6 +589,15 @@
             return `${numeric.toFixed(0)} ${unit}`;
         }
         return `${numeric.toFixed(1)} ${unit}`;
+    };
+
+    const formatGpuDetail = (items) => {
+        if (!Array.isArray(items) || !items.length) {
+            return "未检测到显存占用";
+        }
+        return items
+            .map((item) => `GPU ${item.gpu_index}: ${Number(item.used_memory_mb || 0).toFixed(0)} MB`)
+            .join(" / ");
     };
 
     const renderResourceChart = () => {
@@ -573,9 +631,11 @@
         resourceChart.innerHTML = visibleRows.map((row, index) => {
             const value = Number(row[meta.valueKey] || 0);
             const width = Math.max((value / safeMax) * 100, value > 0 ? 6 : 0);
-            const limitText = meta.limitKey
+            const limitText = key === "gpu"
+                ? formatGpuDetail(row.gpu_memory_detail)
+                : meta.limitKey
                 ? `${meta.limitLabel} ${formatMetricValue(row[meta.limitKey], meta.unit === "%" ? "核" : meta.unit)}`
-                : "默认共享全部 GPU";
+                : (key === "disk" ? "Docker writable layer 占用" : "默认共享全部 GPU");
             return `
                 <article class="resource-bar-card">
                     <div class="resource-bar-meta">
@@ -607,6 +667,68 @@
         renderResourceChart();
     });
 
+    const mergeMetricRows = (rows) => {
+        resourceChartRows = rows.map((row) => ({
+            port: row.port,
+            assignee: row.assignee,
+            status: row.status,
+            cpu_percent: Number(row.cpu_percent || 0),
+            memory_used_gb: Number(row.memory_used_gb || 0),
+            gpu_memory_used_mb: Number(row.gpu_memory_used_mb || 0),
+            gpu_memory_detail: Array.isArray(row.gpu_memory_detail) ? row.gpu_memory_detail : [],
+            disk_used_gb: Number(row.disk_used_gb || 0),
+            disk_virtual_gb: Number(row.disk_virtual_gb || 0),
+            cpu_limit_cores: Number(row.cpu_limit_cores || 0),
+            memory_limit_gb: Number(row.memory_limit_gb || 0),
+            workspace_limit_gb: Number(row.workspace_limit_gb || 0),
+        }));
+    };
+
+    const refreshMetrics = async () => {
+        if (metricsInFlight || document.hidden) {
+            return;
+        }
+        metricsInFlight = true;
+        if (resourceMonitorState) {
+            resourceMonitorState.textContent = "实时监控刷新中...";
+        }
+        try {
+            const response = await fetch(`/hosts/{{ host.id }}/metrics`, {
+                headers: {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json"
+                }
+            });
+            const payload = await response.json().catch(() => ({
+                ok: false,
+                message: `监控返回异常，状态码 ${response.status}`
+            }));
+            if (response.ok && payload.ok) {
+                mergeMetricRows(payload.rows || []);
+                renderResourceChart();
+                if (resourceMonitorState) {
+                    resourceMonitorState.textContent = `实时监控已更新 ${payload.updated_at || ""}`;
+                }
+            } else if (resourceMonitorState) {
+                resourceMonitorState.textContent = payload.message || "实时监控刷新失败";
+            }
+        } catch (error) {
+            if (resourceMonitorState) {
+                resourceMonitorState.textContent = "实时监控暂不可用";
+            }
+        } finally {
+            metricsInFlight = false;
+        }
+    };
+
+    window.setTimeout(refreshMetrics, 1200);
+    window.setInterval(refreshMetrics, 12000);
+    document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+            refreshMetrics();
+        }
+    });
+
     const showToast = (message, type) => {
         toast.classList.remove("hidden", "success", "error");
         toast.classList.add(type);
@@ -621,6 +743,7 @@
         closeActionModal();
         closeSnapshotModal();
         closeAccessModal();
+        closeRestartAllModal(false);
     };
 
     const showFeedbackModal = (message, type = "success", errorLog = "", options = {}) => {
@@ -675,6 +798,7 @@
             submitButton.classList.add("is-busy");
             submitButton.textContent = "创建中...";
         }
+        window.showGlobalBusy?.("正在创建容器，等待后端反馈...");
 
         try {
             const response = await fetch(form.action, {
@@ -714,6 +838,7 @@
         } catch (error) {
             showFeedbackModal("创建请求发送失败，请检查网络或后端状态。", "error");
         } finally {
+            window.hideGlobalBusy?.();
             if (submitButton) {
                 submitButton.disabled = false;
                 submitButton.classList.remove("is-busy");
@@ -800,6 +925,51 @@
         actionConfirm.disabled = false;
     };
 
+    const appendRestartAllLog = (line) => {
+        if (!line || !restartAllLog) {
+            return;
+        }
+        restartAllLog.value = `${restartAllLog.value ? `${restartAllLog.value}\n` : ""}${line}`;
+        restartAllLogWrap?.classList.remove("hidden");
+        restartAllLog.scrollTop = restartAllLog.scrollHeight;
+    };
+
+    const setRestartProgress = (progress, label) => {
+        if (restartAllProgressFill) {
+            restartAllProgressFill.style.width = `${Math.max(0, Math.min(Number(progress || 0), 100))}%`;
+        }
+        if (restartAllProgressLabel) {
+            restartAllProgressLabel.textContent = label || "执行中";
+        }
+    };
+
+    const openRestartAllModal = () => {
+        restartAllModal?.classList.remove("hidden");
+        restartAllModal?.setAttribute("aria-hidden", "false");
+        restartAllMessage.textContent = "将逐个重启当前宿主机端口池内所有容器。";
+        restartAllLog.value = "";
+        restartAllLogWrap?.classList.add("hidden");
+        setRestartProgress(0, "等待开始");
+        restartAllConfirm.disabled = false;
+        restartAllCancel.disabled = false;
+        restartAllConfirm.textContent = "开始重启";
+    };
+
+    const closeRestartAllModal = (allowAbort = true) => {
+        if (allowAbort && restartAllInFlight && restartAllController) {
+            restartAllController.abort();
+            restartAllInFlight = false;
+            window.hideGlobalBusy?.();
+            showFeedbackModal(
+                "已取消等待批量重启结果。",
+                "error",
+                "前端已停止等待。已提交给 Docker 的单个 restart 命令可能仍会执行完成。"
+            );
+        }
+        restartAllModal?.classList.add("hidden");
+        restartAllModal?.setAttribute("aria-hidden", "true");
+    };
+
     openSnapshotButtons.forEach((button) => {
         button.addEventListener("click", () => openSnapshotModal(button));
     });
@@ -825,6 +995,122 @@
     if (actionCancel) {
         actionCancel.addEventListener("click", closeActionModal);
     }
+
+    restartAllOpen?.addEventListener("click", openRestartAllModal);
+    restartAllCancel?.addEventListener("click", () => closeRestartAllModal(true));
+
+    restartAllConfirm?.addEventListener("click", async () => {
+        if (restartAllInFlight) {
+            return;
+        }
+        restartAllInFlight = true;
+        restartAllController = new AbortController();
+        restartAllConfirm.disabled = true;
+        restartAllConfirm.classList.add("is-busy");
+        restartAllConfirm.textContent = "重启中...";
+        restartAllCancel.disabled = false;
+        restartAllMessage.textContent = "正在逐个重启端口容器，请不要关闭页面。";
+        setRestartProgress(3, "请求已提交，等待后端开始执行...");
+        appendRestartAllLog("开始批量重启请求。");
+        window.showGlobalBusy?.("正在批量重启容器，读取后端进度...");
+
+        try {
+            const response = await fetch(`/hosts/{{ host.id }}/containers/restart-all/stream`, {
+                method: "POST",
+                headers: {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/x-ndjson"
+                },
+                signal: restartAllController.signal
+            });
+            if (!response.body) {
+                throw new Error(`浏览器不支持读取流式响应，状态码 ${response.status}`);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let finalPayload = null;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    break;
+                }
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                    if (!line.trim()) {
+                        continue;
+                    }
+                    const item = JSON.parse(line);
+                    if (item.event === "log") {
+                        appendRestartAllLog(item.message || "");
+                    } else if (item.event === "progress") {
+                        appendRestartAllLog(item.message || "");
+                        setRestartProgress(item.progress || 0, `${item.completed || 0}/${item.total || 0} ${item.message || "重启中"}`);
+                    } else if (item.event === "done" || item.event === "error") {
+                        finalPayload = item;
+                        if (item.progress !== undefined) {
+                            setRestartProgress(item.progress, `${item.completed || 0}/${item.total || 0} ${item.message || ""}`);
+                        }
+                    }
+                }
+            }
+            if (buffer.trim()) {
+                const item = JSON.parse(buffer);
+                if (item.event === "log") {
+                    appendRestartAllLog(item.message || "");
+                } else if (item.event === "progress") {
+                    appendRestartAllLog(item.message || "");
+                    setRestartProgress(item.progress || 0, `${item.completed || 0}/${item.total || 0} ${item.message || "重启中"}`);
+                } else if (item.event === "done" || item.event === "error") {
+                    finalPayload = item;
+                }
+            }
+
+            restartAllInFlight = false;
+            window.hideGlobalBusy?.();
+            restartAllConfirm.classList.remove("is-busy");
+            restartAllConfirm.disabled = false;
+            restartAllConfirm.textContent = "再次重启";
+
+            if (response.ok && finalPayload && finalPayload.ok) {
+                setRestartProgress(100, finalPayload.message || "批量重启完成");
+                showFeedbackModal(
+                    finalPayload.message || "批量重启完成。",
+                    "success",
+                    "",
+                    { reloadOnClose: true }
+                );
+            } else {
+                setRestartProgress(100, (finalPayload && finalPayload.message) || "批量重启失败");
+                showFeedbackModal(
+                    (finalPayload && finalPayload.message) || "批量重启失败。",
+                    "error",
+                    (finalPayload && finalPayload.error_log) || `HTTP ${response.status}`
+                );
+            }
+        } catch (error) {
+            restartAllInFlight = false;
+            window.hideGlobalBusy?.();
+            restartAllConfirm.classList.remove("is-busy");
+            restartAllConfirm.disabled = false;
+            restartAllConfirm.textContent = "再次重启";
+            if (error && error.name === "AbortError") {
+                setRestartProgress(100, "已取消等待");
+                showFeedbackModal(
+                    "已取消等待批量重启结果。",
+                    "error",
+                    "前端请求已取消。已提交给 Docker 的单个 restart 命令可能仍会执行完成。"
+                );
+            } else {
+                setRestartProgress(100, "请求失败");
+                showFeedbackModal("批量重启请求发送失败，请检查网络或后端状态。", "error", String(error));
+            }
+        }
+    });
 
     if (feedbackClose) {
         feedbackClose.addEventListener("click", closeFeedbackModal);
@@ -877,6 +1163,7 @@
             const actionLabel = button.dataset.actionLabel || "执行";
             actionConfirm.disabled = true;
             actionConfirm.classList.add("is-busy");
+            window.showGlobalBusy?.(`正在${actionLabel}容器，等待后端反馈...`);
 
             try {
                 const requestUrl = actionForm.getAttribute("action") || "";
@@ -917,6 +1204,8 @@
                 showFeedbackModal(`${actionLabel}请求发送失败，请检查后端状态。`, "error");
                 actionConfirm.disabled = false;
                 actionConfirm.classList.remove("is-busy");
+            } finally {
+                window.hideGlobalBusy?.();
             }
         });
     }
@@ -931,6 +1220,7 @@
                 submitButton.classList.add("is-busy");
                 submitButton.textContent = "处理中...";
             }
+            window.showGlobalBusy?.("维护操作已提交，等待后端反馈...");
 
             try {
                 const response = await fetch(asyncForm.action, {
@@ -966,6 +1256,7 @@
             } catch (error) {
                 showFeedbackModal("请求发送失败，请检查后端状态。", "error");
             } finally {
+                window.hideGlobalBusy?.();
                 if (submitButton) {
                     submitButton.disabled = false;
                     submitButton.classList.remove("is-busy");
@@ -985,6 +1276,7 @@
             snapshotCancel.disabled = false;
             snapshotController = new AbortController();
             snapshotInFlight = true;
+            window.showGlobalBusy?.("快照任务执行中，正在读取后端日志...");
             feedbackLog.value = "";
             feedbackLogWrap.classList.remove("hidden");
             feedbackCopyLog.classList.remove("hidden");
@@ -1054,6 +1346,7 @@
 
                 if (response.ok && finalPayload && finalPayload.ok) {
                     snapshotConfirm.classList.remove("is-busy");
+                    window.hideGlobalBusy?.();
                     showFeedbackModal(
                         finalPayload.message || "环境快照创建成功。",
                         "success",
@@ -1061,6 +1354,7 @@
                         { reloadOnClose: true }
                     );
                 } else {
+                    window.hideGlobalBusy?.();
                     showFeedbackModal(
                         (finalPayload && finalPayload.message) || "环境快照创建失败。",
                         "error",
@@ -1076,6 +1370,7 @@
                     progressTimer = null;
                 }
                 snapshotInFlight = false;
+                window.hideGlobalBusy?.();
                 if (error && error.name === "AbortError") {
                     showFeedbackModal(
                         "已取消等待快照结果。",

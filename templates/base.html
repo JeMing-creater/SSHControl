@@ -7,6 +7,11 @@
     <link rel="stylesheet" href="/static/css/app.css">
 </head>
 <body>
+    <div id="global-busy-bar" class="busy-bar" aria-hidden="true"></div>
+    <div id="global-busy-pill" class="busy-pill hidden" aria-live="polite">
+        <span class="busy-dot"></span>
+        <span id="global-busy-text">后端处理中...</span>
+    </div>
     <header class="topbar">
         <div>
             <p class="eyebrow">Docker Multi-Host Control</p>
@@ -66,8 +71,12 @@
         const close = document.getElementById("global-feedback-close");
         const toast = document.getElementById("global-toast");
         const toastBody = document.getElementById("global-toast-body");
+        const busyBar = document.getElementById("global-busy-bar");
+        const busyPill = document.getElementById("global-busy-pill");
+        const busyText = document.getElementById("global-busy-text");
         const logLines = [];
         let timer = null;
+        let busyTimer = null;
         let redirectUrl = "";
         let reloadOnClose = false;
 
@@ -104,6 +113,31 @@
             showToast(text, type);
         };
 
+        const showBusy = (text = "后端处理中...") => {
+            if (busyText) {
+                busyText.textContent = text;
+            }
+            busyBar?.classList.add("active");
+            busyPill?.classList.remove("hidden");
+            if (busyTimer) {
+                clearTimeout(busyTimer);
+            }
+            busyTimer = setTimeout(() => {
+                if (busyText) {
+                    busyText.textContent = "后端仍在执行，请稍候...";
+                }
+            }, 1800);
+        };
+
+        const hideBusy = () => {
+            if (busyTimer) {
+                clearTimeout(busyTimer);
+                busyTimer = null;
+            }
+            busyBar?.classList.remove("active");
+            busyPill?.classList.add("hidden");
+        };
+
         const appendLog = (line) => {
             if (!line) {
                 return;
@@ -116,6 +150,8 @@
 
         window.showGlobalFeedback = showModal;
         window.appendGlobalFeedbackLog = appendLog;
+        window.showGlobalBusy = showBusy;
+        window.hideGlobalBusy = hideBusy;
 
         close.addEventListener("click", () => {
             modal.classList.add("hidden");
@@ -152,6 +188,7 @@
                     submitButton.classList.add("is-busy");
                     submitButton.textContent = "处理中...";
                 }
+                showBusy("请求已发送，等待后端反馈...");
                 try {
                     const response = await fetch(form.action, {
                         method: form.method || "POST",
@@ -191,6 +228,7 @@
                 } catch (error) {
                     showModal("请求发送失败，请检查网络或后端状态。", "error", String(error));
                 } finally {
+                    hideBusy();
                     if (submitButton) {
                         submitButton.disabled = false;
                         submitButton.classList.remove("is-busy");

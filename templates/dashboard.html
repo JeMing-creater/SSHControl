@@ -9,6 +9,21 @@
     </div>
 </section>
 
+<section class="compute-overview">
+    <div class="compute-overview-head">
+        <div>
+            <p class="eyebrow">算力调度系统</p>
+            <h3>实时 GPU 峰值态势</h3>
+        </div>
+        <div class="compute-overview-kpis">
+            <span><strong id="compute-host-count">{{ visual.host_count }}</strong> 台服务器</span>
+            <span><strong id="compute-gpu-percent">{{ "%.1f"|format(visual.overall_gpu_percent) }}</strong>% 总显存</span>
+            <span><strong id="compute-container-count">{{ visual.total_containers }}</strong> 个容器</span>
+        </div>
+    </div>
+    <canvas id="compute-canvas" width="1400" height="460"></canvas>
+</section>
+
 <section class="grid cards">
     {% for card in host_cards %}
     <article class="card">
@@ -102,4 +117,241 @@
         </tbody>
     </table>
 </section>
+
+<script>
+(() => {
+    const initialPayload = {{ visual | tojson }};
+    const canvas = document.getElementById("compute-canvas");
+    if (!canvas) {
+        return;
+    }
+    const ctx = canvas.getContext("2d");
+    const hostCountEl = document.getElementById("compute-host-count");
+    const gpuPercentEl = document.getElementById("compute-gpu-percent");
+    const containerCountEl = document.getElementById("compute-container-count");
+    const font = '"HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", sans-serif';
+    const nodes = new Map();
+    let payload = initialPayload;
+
+    const resize = () => {
+        const rect = canvas.parentElement.getBoundingClientRect();
+        const ratio = window.devicePixelRatio || 1;
+        canvas.width = Math.max(960, Math.floor(rect.width * ratio));
+        canvas.height = Math.floor(Math.max(340, Math.min(rect.width * 0.32, 500)) * ratio);
+        canvas.style.height = `${canvas.height / ratio}px`;
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    };
+
+    const syncNodes = () => {
+        const hosts = payload.hosts || [];
+        const active = new Set(hosts.map((host) => String(host.id)));
+        hosts.forEach((host, index) => {
+            const id = String(host.id);
+            if (!nodes.has(id)) {
+                nodes.set(id, { x: 0, y: 0, phase: Math.random() * Math.PI * 2, host });
+            }
+            const node = nodes.get(id);
+            node.host = host;
+            const lane = hosts.length <= 1 ? 0.5 : index / (hosts.length - 1);
+            node.tx = canvas.clientWidth * (0.29 + lane * 0.42);
+            node.ty = canvas.clientHeight * (0.74 + 0.045 * Math.sin(index * 1.4));
+            if (!node.x && !node.y) {
+                node.x = node.tx;
+                node.y = node.ty;
+            }
+        });
+        [...nodes.keys()].forEach((id) => {
+            if (!active.has(id)) {
+                nodes.delete(id);
+            }
+        });
+    };
+
+    const drawSoftLine = (x1, y1, x2, y2, alpha) => {
+        const gradient = ctx.createLinearGradient(x1, y1, x2, y2);
+        gradient.addColorStop(0, `rgba(20, 116, 102, ${0.04 * alpha})`);
+        gradient.addColorStop(0.5, `rgba(47, 134, 214, ${0.22 * alpha})`);
+        gradient.addColorStop(1, `rgba(20, 116, 102, ${0.05 * alpha})`);
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+    };
+
+    const drawSurface = (time) => {
+        const hosts = payload.hosts || [];
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        const cols = 78;
+        const rows = 18;
+        const grid = [];
+        for (let j = 0; j < rows; j += 1) {
+            const row = [];
+            for (let i = 0; i < cols; i += 1) {
+                const nx = -1 + (i / (cols - 1)) * 3;
+                const ny = j / (rows - 1);
+                let z = 0;
+                let influence = 0;
+                hosts.forEach((host, index) => {
+                    const cx = hosts.length <= 1 ? 0.5 : index / Math.max(hosts.length - 1, 1);
+                    const cy = 0.5 + 0.12 * Math.sin(index * 1.25);
+                    const dx = nx - cx;
+                    const dy = ny - cy;
+                    const intensity = Math.max(0, Number(host.intensity || 0));
+                    const bump = Math.exp(-(dx * dx / 0.012 + dy * dy / 0.046));
+                    influence += bump;
+                    z += bump * (8 + 128 * intensity);
+                });
+                z += Math.sin(time * 0.0018 + i * 0.28 + j * 0.18) * 1.6;
+                const x = w * 0.29 + nx * w * 0.42 + (j - rows / 2) * 8.5;
+                const y = h * 0.52 + (j - rows / 2) * 8 - z;
+                row.push({ x, y, z, influence });
+            }
+            grid.push(row);
+        }
+        ctx.save();
+        ctx.globalCompositeOperation = "source-over";
+        for (let j = 0; j < rows - 1; j += 1) {
+            for (let i = 0; i < cols - 1; i += 1) {
+                const p = grid[j][i];
+                const p2 = grid[j][i + 1];
+                const p3 = grid[j + 1][i + 1];
+                const p4 = grid[j + 1][i];
+                const influence = Math.min((p.influence + p2.influence + p3.influence + p4.influence) / 2.6, 1);
+                const shade = Math.min((p.z + p2.z + p3.z + p4.z) / 330, 1);
+                const alpha = Math.min(0.035 + influence * 0.16 + shade * 0.38, 0.72);
+                ctx.fillStyle = `rgba(${155 + shade * 95}, ${221 + shade * 22}, ${205 - shade * 70}, ${alpha})`;
+                ctx.strokeStyle = `rgba(20, 116, 102, ${0.045 + influence * 0.2 + shade * 0.08})`;
+                ctx.lineWidth = 0.58 + shade * 0.42;
+                ctx.beginPath();
+                ctx.moveTo(p.x, p.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.lineTo(p3.x, p3.y);
+                ctx.lineTo(p4.x, p4.y);
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+        hosts.forEach((host, index) => {
+            const lane = hosts.length <= 1 ? 0.5 : index / Math.max(hosts.length - 1, 1);
+            const x = w * 0.29 + lane * w * 0.42;
+            const y = h * (0.48 + 0.12 * Math.sin(index * 1.25));
+            const intensity = Math.max(0, Number(host.intensity || 0));
+            if (intensity <= 0.02) {
+                return;
+            }
+            const glow = ctx.createRadialGradient(x, y - 88 * intensity, 0, x, y - 88 * intensity, 78 + intensity * 48);
+            glow.addColorStop(0, `rgba(255, 239, 140, ${0.34 + intensity * 0.36})`);
+            glow.addColorStop(0.34, `rgba(50, 190, 150, ${0.18 + intensity * 0.18})`);
+            glow.addColorStop(1, "rgba(50, 190, 150, 0)");
+            ctx.fillStyle = glow;
+            ctx.beginPath();
+            ctx.arc(x, y - 88 * intensity, 84 + intensity * 50, 0, Math.PI * 2);
+            ctx.fill();
+        });
+        ctx.restore();
+    };
+
+    const drawNode = (node, time) => {
+        node.x += (node.tx - node.x) * 0.06;
+        node.y += (node.ty - node.y) * 0.06;
+        const host = node.host;
+        const bob = Math.sin(time * 0.002 + node.phase) * 4;
+        const x = node.x;
+        const y = node.y + bob;
+        const intensity = Math.max(0.08, Number(host.intensity || 0));
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.shadowColor = `rgba(20, 116, 102, ${0.22 + intensity * 0.22})`;
+        ctx.shadowBlur = 16 + intensity * 18;
+        ctx.fillStyle = `rgba(20, 116, 102, ${0.12 + intensity * 0.16})`;
+        ctx.beginPath();
+        ctx.ellipse(0, 30, 46, 12, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "rgba(227, 244, 239, 0.94)";
+        ctx.strokeStyle = "rgba(20, 116, 102, 0.48)";
+        ctx.lineWidth = 1.3;
+        ctx.beginPath();
+        ctx.moveTo(-20, -24);
+        ctx.lineTo(14, -36);
+        ctx.lineTo(28, -22);
+        ctx.lineTo(-6, -8);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(185, 218, 209, 0.95)";
+        ctx.beginPath();
+        ctx.moveTo(-6, -8);
+        ctx.lineTo(28, -22);
+        ctx.lineTo(28, 18);
+        ctx.lineTo(-6, 34);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(210, 235, 229, 0.95)";
+        ctx.beginPath();
+        ctx.moveTo(-20, -24);
+        ctx.lineTo(-6, -8);
+        ctx.lineTo(-6, 34);
+        ctx.lineTo(-20, 18);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(32, 40, 36, 0.88)";
+        ctx.font = `700 13px ${font}`;
+        ctx.textAlign = "center";
+        ctx.fillText(host.name, 0, 55);
+        ctx.fillStyle = "rgba(20, 116, 102, 0.82)";
+        ctx.font = `12px ${font}`;
+        ctx.fillText(`${Number(host.gpu_percent || 0).toFixed(1)}% 显存 / ${host.running_count} running`, 0, 73);
+        ctx.restore();
+    };
+
+    const draw = (time) => {
+        syncNodes();
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        ctx.clearRect(0, 0, w, h);
+        const bg = ctx.createLinearGradient(0, 0, w, h);
+        bg.addColorStop(0, "rgba(251,253,251,0.98)");
+        bg.addColorStop(0.55, "rgba(246,250,248,0.92)");
+        bg.addColorStop(1, "rgba(239,247,244,0.82)");
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, w, h);
+        drawSurface(time);
+        const hubX = w / 2;
+        const hubY = h * 0.48;
+        nodes.forEach((node) => drawSoftLine(hubX, hubY, node.x, node.y, 1));
+        nodes.forEach((node) => drawNode(node, time));
+        requestAnimationFrame(draw);
+    };
+
+    const refresh = async () => {
+        try {
+            const response = await fetch("/compute-visual/data", {
+                headers: {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+            });
+            const next = await response.json();
+            if (response.ok && next.ok) {
+                payload = next;
+                hostCountEl.textContent = next.host_count;
+                gpuPercentEl.textContent = Number(next.overall_gpu_percent || 0).toFixed(1);
+                containerCountEl.textContent = next.total_containers;
+            }
+        } catch (error) {
+            // Visual only: keep the last frame.
+        }
+    };
+
+    resize();
+    syncNodes();
+    requestAnimationFrame(draw);
+    window.addEventListener("resize", resize);
+    window.setInterval(refresh, 8000);
+})();
+</script>
 {% endblock %}
