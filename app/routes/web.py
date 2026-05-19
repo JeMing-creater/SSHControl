@@ -18,6 +18,7 @@ from app.models import AdminStatus, AdminUser, Allocation, AllocationStatus, Aut
 from app.services.admission import check_allocation, recommended_defaults
 from app.services.docker_engine import DockerService, slugify
 from app.services.host_cache import schedule_host_refresh
+from app.services.image_filters import filter_supported_base_images, is_supported_base_image
 from app.services.metrics import parse_memory_usage, parse_percent
 from app.services.snapshots import create_snapshot_record, effective_snapshot_policy
 from app.services.ssh_client import RunnerError, get_runner
@@ -764,6 +765,8 @@ def validate_ssh_docker(host: ManagedHost) -> dict:
     docker_info = docker.docker_info()
     disk_info = docker.filesystem_usage_gb(host.workspace_root)
     used_ports = docker.used_host_ports()
+    discovered_images = docker.discover_images()
+    host.cached_images = json.dumps(discovered_images, ensure_ascii=False) if discovered_images else None
     available_ports = [
         port for port in range(host.port_start, host.port_end + 1) if port not in used_ports
     ]
@@ -772,6 +775,7 @@ def validate_ssh_docker(host: ManagedHost) -> dict:
         "disk_info": disk_info,
         "used_ports": sorted(used_ports),
         "available_ports": available_ports,
+        "images": discovered_images,
     }
 
 
@@ -788,7 +792,7 @@ def parse_cached_images(raw: str | None) -> list[str]:
         return []
     if not isinstance(value, list):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    return filter_supported_base_images([str(item).strip() for item in value if str(item).strip()])
 
 
 def render_initial_setup(request: Request, message: str = "", error_log: str = ""):
@@ -1424,12 +1428,14 @@ def host_detail(request: Request, host_id: int):
             schedule_host_refresh(host.id, full=not bool(cached["refreshed_at"]))
         host_images = parse_cached_images(host.cached_images)
         if not host_images and cached["container_rows"]:
-            host_images = sorted(
-                {
-                    (row.get("image_name") or "").strip()
-                    for row in cached["container_rows"]
-                    if (row.get("image_name") or "").strip()
-                }
+            host_images = filter_supported_base_images(
+                sorted(
+                    {
+                        (row.get("image_name") or "").strip()
+                        for row in cached["container_rows"]
+                        if (row.get("image_name") or "").strip()
+                    }
+                )
             )
             if host_images:
                 host.cached_images = json.dumps(host_images, ensure_ascii=False)
@@ -2139,6 +2145,11 @@ def create_allocation(
         selected_image = (base_image_override or "").strip()
         if not selected_image:
             return respond_error("请选择或填写该宿主机本地已有基础镜像。", status_code=400)
+        if not is_supported_base_image(selected_image):
+            return respond_error(
+                "基础镜像格式不符合平台要求，请选择 pytorch:x.x.x-cudax.x-cudnn... 形式的镜像。",
+                status_code=400,
+            )
 
         if allocation is None:
             allocation = Allocation(

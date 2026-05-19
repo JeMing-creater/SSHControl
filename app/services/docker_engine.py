@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 
 from app.models import Allocation, AllocationStatus, ManagedHost
+from app.services.image_filters import filter_supported_base_images
 from app.services.ssh_client import RunnerError, get_runner
 
 
@@ -390,17 +391,17 @@ exit 1
 
     def discover_images(self) -> list[str]:
         try:
-            images = self.list_images()
+            images = filter_supported_base_images(self.list_images())
         except RunnerError:
             images = []
         if images:
             return images
 
-        images = self.images_from_containers()
+        images = filter_supported_base_images(self.images_from_containers())
         if images:
             return images
 
-        images = self.images_from_root_dockerfile()
+        images = filter_supported_base_images(self.images_from_root_dockerfile())
         if images:
             return images
 
@@ -412,7 +413,7 @@ exit 1
         result = self.runner.run(command, timeout=120)
         if not result.ok or not result.stdout.strip():
             return []
-        return self._images_from_dockerfile_text(result.stdout)
+        return filter_supported_base_images(self._images_from_dockerfile_text(result.stdout))
 
     def container_details(self, timeout: int = 240) -> list[dict]:
         raw = self._run(
