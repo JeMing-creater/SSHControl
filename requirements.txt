@@ -6,3 +6,4 @@ jinja2
 python-multipart
 pydantic-settings
 paramiko
+reportlab

@@ -313,6 +313,134 @@ def remove_cached_container_row(db: Session, host_id: int, container_name: str) 
     return changed
 
 
+def update_cached_container_status(
+    db: Session,
+    host_id: int,
+    container_name: str,
+    status: str,
+    host_port: int | None = None,
+    image_name: str | None = None,
+) -> bool:
+    target = container_name.strip().lstrip("/")
+    if not target:
+        return False
+    if status == AllocationStatus.DELETED.value:
+        return remove_cached_container_row(db, host_id, target)
+
+    cache = db.query(HostStatusCache).filter(HostStatusCache.host_id == host_id).first()
+    if not cache:
+        if host_port is None:
+            return False
+        cache = HostStatusCache(host_id=host_id)
+        db.add(cache)
+
+    resolved_port = int(host_port) if host_port is not None else None
+
+    def row_matches(row: dict) -> bool:
+        row_name = str(row.get("container_name") or row.get("Name") or "").strip().lstrip("/")
+        if row_name == target:
+            return True
+        if resolved_port is None:
+            return False
+        try:
+            return int(row.get("host_port")) == resolved_port
+        except (TypeError, ValueError):
+            return False
+
+    def update_row_list(raw: str | None) -> tuple[str, bool]:
+        rows = parse_cache_json(raw, [])
+        if not isinstance(rows, list):
+            rows = []
+        changed = False
+        found = False
+        next_rows = []
+        for row in rows:
+            if not isinstance(row, dict) or not row_matches(row):
+                next_rows.append(row)
+                continue
+            current = dict(row)
+            current["container_name"] = target
+            current["status"] = status
+            current["cache_pending"] = True
+            if resolved_port is not None:
+                current["host_port"] = resolved_port
+            if image_name:
+                current["image_name"] = image_name
+            detail = current.get("detail")
+            if isinstance(detail, dict):
+                state = detail.setdefault("State", {})
+                if isinstance(state, dict):
+                    state["Running"] = status == AllocationStatus.RUNNING.value
+                    state["Status"] = "running" if status == AllocationStatus.RUNNING.value else "exited"
+            next_rows.append(current)
+            found = True
+            changed = True
+        if not found and resolved_port is not None:
+            next_rows.append(
+                {
+                    "container_name": target,
+                    "host_port": resolved_port,
+                    "status": status,
+                    "image_name": image_name or "",
+                    "cache_pending": True,
+                }
+            )
+            changed = True
+        return json.dumps(next_rows, ensure_ascii=False), changed
+
+    def prune_row_list(raw: str | None) -> tuple[str | None, bool]:
+        rows = parse_cache_json(raw, [])
+        if not isinstance(rows, list):
+            return raw, False
+        next_rows = [
+            row
+            for row in rows
+            if not (
+                isinstance(row, dict)
+                and str(row.get("Name") or row.get("container_name") or "").strip().lstrip("/") == target
+            )
+        ]
+        if len(next_rows) == len(rows):
+            return raw, False
+        return json.dumps(next_rows, ensure_ascii=False), True
+
+    def prune_mapping(raw: str | None) -> tuple[str | None, bool]:
+        mapping = parse_cache_json(raw, {})
+        if not isinstance(mapping, dict) or target not in mapping:
+            return raw, False
+        next_mapping = dict(mapping)
+        next_mapping.pop(target, None)
+        return json.dumps(next_mapping, ensure_ascii=False), True
+
+    changed = False
+    for attr in ("container_rows_json", "stable_container_rows_json"):
+        next_value, attr_changed = update_row_list(getattr(cache, attr))
+        if attr_changed:
+            setattr(cache, attr, next_value)
+            changed = True
+
+    if status != AllocationStatus.RUNNING.value:
+        for attr in ("stats_json", "stable_stats_json"):
+            next_value, attr_changed = prune_row_list(getattr(cache, attr))
+            if attr_changed:
+                setattr(cache, attr, next_value)
+                changed = True
+        for attr in ("gpu_detail_json", "stable_gpu_detail_json"):
+            next_value, attr_changed = prune_mapping(getattr(cache, attr))
+            if attr_changed:
+                setattr(cache, attr, next_value)
+                changed = True
+
+    if changed:
+        now = datetime.utcnow()
+        cache.reachable = True
+        cache.stable_reachable = True
+        cache.updated_at = now
+        cache.refreshed_at = cache.refreshed_at or now
+        cache.stable_refreshed_at = cache.stable_refreshed_at or now
+    return changed
+
+
 def upsert_cached_container_row(
     db: Session,
     host_id: int,
@@ -2258,16 +2386,44 @@ def allocation_action(
         if action == "stop":
             logs.append(f"尝试停止端口 {allocation.host_port}")
             docker.stop_container(allocation)
+            if update_cached_container_status(
+                db,
+                allocation.host_id,
+                allocation.container_name,
+                allocation.status,
+                allocation.host_port,
+                allocation.image_name,
+            ):
+                logs.append("已同步平台缓存状态为 stopped")
+            schedule_host_refresh(allocation.host_id, full=False)
             success_message = f"端口 {allocation.host_port} 已停止。"
         elif action == "start":
             if allocation.pending_rebuild:
                 logs.append("检测到需重建状态，准备重建后启动")
-                docker.rebuild_container(allocation)
+                docker.rebuild_container(allocation, logs=logs)
+                upsert_cached_container_row(
+                    db,
+                    allocation.host_id,
+                    allocation.container_name,
+                    allocation.host_port,
+                    allocation.image_name,
+                    allocation.status,
+                )
                 success_message = f"端口 {allocation.host_port} 已按最新挂载配置重建并启动。"
             else:
                 logs.append(f"尝试启动端口 {allocation.host_port}")
                 docker.start_container(allocation)
+                if update_cached_container_status(
+                    db,
+                    allocation.host_id,
+                    allocation.container_name,
+                    allocation.status,
+                    allocation.host_port,
+                    allocation.image_name,
+                ):
+                    logs.append("已同步平台缓存状态为 running")
                 success_message = f"端口 {allocation.host_port} 已启动。"
+            schedule_host_refresh(allocation.host_id, full=False)
         elif action == "delete":
             logs.append(f"尝试删除端口 {allocation.host_port} 容器")
             deleted_container_name = allocation.container_name
@@ -2354,10 +2510,16 @@ def external_container_action(
 
         docker = DockerService(host)
         if action == "stop":
-            docker.stop_container_by_name(container_name)
+            runtime_status = docker.stop_container_by_name(container_name)
+            update_cached_container_status(db, host.id, container_name, runtime_status)
+            schedule_host_refresh(host.id, full=False)
+            db.commit()
             message = f"容器 {container_name} 已停止。"
         elif action == "start":
-            docker.start_container_by_name(container_name)
+            runtime_status = docker.start_container_by_name(container_name)
+            update_cached_container_status(db, host.id, container_name, runtime_status)
+            schedule_host_refresh(host.id, full=False)
+            db.commit()
             message = f"容器 {container_name} 已启动。"
         elif action == "delete":
             docker.remove_container_by_name(container_name)
