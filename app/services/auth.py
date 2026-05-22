@@ -18,6 +18,7 @@ from app.models import AdminStatus, AdminUser, Allocation, AllocationStatus, Pla
 SESSION_COOKIE = "control_admin_session"
 USER_SESSION_COOKIE = "control_user_session"
 SESSION_MAX_AGE_SECONDS = 5 * 24 * 60 * 60
+TERMINAL_TOKEN_MAX_AGE_SECONDS = 10 * 60
 
 
 def password_hash(password: str) -> str:
@@ -51,7 +52,24 @@ def sign_session(account: str, ip_address: str) -> str:
     return f"{payload}.{signature}"
 
 
-def read_session(value: str | None, ip_address: str) -> str | None:
+def sign_terminal_token(account: str, scope: str, resource_id: int) -> str:
+    settings = get_settings()
+    payload_data = {
+        "account": account,
+        "scope": scope,
+        "resource_id": int(resource_id),
+        "exp": int((datetime.utcnow() + timedelta(seconds=TERMINAL_TOKEN_MAX_AGE_SECONDS)).timestamp()),
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(payload_data, separators=(",", ":")).encode("utf-8")).decode("ascii")
+    signature = hmac.new(
+        settings.auth_secret_key.encode("utf-8"),
+        payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def read_terminal_token(value: str | None, scope: str, resource_id: int) -> str | None:
     if not value or "." not in value:
         return None
     settings = get_settings()
@@ -67,7 +85,36 @@ def read_session(value: str | None, ip_address: str) -> str | None:
         data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
     except Exception:
         return None
-    if data.get("ip") != ip_address:
+    if data.get("scope") != scope:
+        return None
+    try:
+        token_resource_id = int(data.get("resource_id"))
+    except (TypeError, ValueError):
+        return None
+    if token_resource_id != int(resource_id):
+        return None
+    if int(data.get("exp") or 0) < int(datetime.utcnow().timestamp()):
+        return None
+    return str(data.get("account") or "") or None
+
+
+def read_session(value: str | None, ip_address: str | None, *, verify_ip: bool = True) -> str | None:
+    if not value or "." not in value:
+        return None
+    settings = get_settings()
+    payload, signature = value.rsplit(".", 1)
+    expected = hmac.new(
+        settings.auth_secret_key.encode("utf-8"),
+        payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    if verify_ip and data.get("ip") != ip_address:
         return None
     if int(data.get("exp") or 0) < int(datetime.utcnow().timestamp()):
         return None

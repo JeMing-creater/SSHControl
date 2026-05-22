@@ -59,6 +59,12 @@
             </div>
             <div class="form-grid">
                 <p id="global-feedback-message" class="wide muted"></p>
+                <div id="global-feedback-progress-wrap" class="wide feedback-progress hidden">
+                    <div class="progress-bar">
+                        <div id="global-feedback-progress-fill" class="progress-fill"></div>
+                    </div>
+                    <p id="global-feedback-progress-text" class="muted">0%</p>
+                </div>
                 <label id="global-feedback-log-wrap" class="wide hidden">错误日志
                     <textarea id="global-feedback-log" rows="10" readonly></textarea>
                 </label>
@@ -74,6 +80,9 @@
         const modal = document.getElementById("global-feedback-modal");
         const title = document.getElementById("global-feedback-title");
         const message = document.getElementById("global-feedback-message");
+        const progressWrap = document.getElementById("global-feedback-progress-wrap");
+        const progressFill = document.getElementById("global-feedback-progress-fill");
+        const progressText = document.getElementById("global-feedback-progress-text");
         const logWrap = document.getElementById("global-feedback-log-wrap");
         const log = document.getElementById("global-feedback-log");
         const copy = document.getElementById("global-feedback-copy");
@@ -106,12 +115,34 @@
         const showModal = (text, type = "success", errorLog = "", options = {}) => {
             redirectUrl = options.redirectUrl || "";
             reloadOnClose = Boolean(options.reloadOnClose);
-            title.textContent = type === "error" ? "操作失败" : "操作完成";
+            const preserveLog = Boolean(options.preserveLog);
+            if (!preserveLog) {
+                logLines.length = 0;
+            }
+            title.textContent = options.title || (type === "error" ? "操作失败" : "操作完成");
             message.textContent = text;
-            if (type === "error" && errorLog) {
-                log.value = errorLog;
+            if (progressWrap && progressFill && progressText) {
+                const showProgress = Boolean(options.showProgress);
+                progressWrap.classList.toggle("hidden", !showProgress);
+                const progress = Number(options.progress || 0);
+                progressFill.style.width = `${Math.max(0, Math.min(progress, 100))}%`;
+                progressText.textContent = `${Math.round(Math.max(0, Math.min(progress, 100)))}%`;
+            }
+            if ((type === "error" && errorLog) || options.showLog) {
+                if (errorLog) {
+                    if (preserveLog && logLines.length) {
+                        logLines.push(errorLog);
+                        log.value = logLines.join("\n");
+                    } else {
+                        logLines.length = 0;
+                        logLines.push(errorLog);
+                        log.value = errorLog;
+                    }
+                } else {
+                    log.value = logLines.join("\n");
+                }
                 logWrap.classList.remove("hidden");
-                copy.classList.remove("hidden");
+                copy.classList.toggle("hidden", !log.value);
             } else {
                 log.value = "";
                 logWrap.classList.add("hidden");
@@ -154,11 +185,25 @@
             logLines.push(line);
             if (!modal.classList.contains("hidden")) {
                 log.value = logLines.join("\n");
+                logWrap.classList.remove("hidden");
+                copy.classList.remove("hidden");
+                log.scrollTop = log.scrollHeight;
             }
+        };
+
+        const setModalProgress = (progress, text = "") => {
+            if (!progressWrap || !progressFill || !progressText) {
+                return;
+            }
+            const value = Math.max(0, Math.min(Number(progress) || 0, 100));
+            progressWrap.classList.remove("hidden");
+            progressFill.style.width = `${value}%`;
+            progressText.textContent = text || `${Math.round(value)}%`;
         };
 
         window.showGlobalFeedback = showModal;
         window.appendGlobalFeedbackLog = appendLog;
+        window.setGlobalFeedbackProgress = setModalProgress;
         window.showGlobalBusy = showBusy;
         window.hideGlobalBusy = hideBusy;
 

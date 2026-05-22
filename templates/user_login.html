@@ -1,11 +1,14 @@
 {% extends "base.html" %}
 
 {% block content %}
-<section class="login-visual-shell" aria-hidden="true">
-    <canvas id="login-compute-canvas" width="1200" height="300"></canvas>
-</section>
+{% set login_visual_theme = "user" %}
+{% include "login_visual.html" %}
 
 <section class="panel auth-panel">
+    <a class="login-switch-button" href="/login" aria-label="切换登录形式：管理员登录" title="切换登录形式：管理员登录">
+        <span aria-hidden="true">⇄</span>
+        <em>切换登录形式</em>
+    </a>
     <div class="panel-head">
         <div>
             <p class="eyebrow">使用者登录</p>
@@ -23,109 +26,7 @@
         <label><span class="required-mark">*</span>密码<input name="password" type="password" required></label>
         <div class="wide action-row">
             <button class="button" type="submit">使用者登录</button>
-            <a class="button secondary" href="/login">管理员登录</a>
         </div>
     </form>
 </section>
-
-<script>
-(() => {
-    const payload = {{ visual | tojson }};
-    const canvas = document.getElementById("login-compute-canvas");
-    if (!canvas) {
-        return;
-    }
-    const ctx = canvas.getContext("2d");
-
-    const resize = () => {
-        const ratio = window.devicePixelRatio || 1;
-        canvas.width = Math.floor(window.innerWidth * ratio);
-        canvas.height = Math.floor(window.innerHeight * ratio);
-        canvas.style.width = "100vw";
-        canvas.style.height = "100vh";
-        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    };
-
-    const drawSurface = (time) => {
-        const hosts = payload.hosts || [];
-        const w = canvas.clientWidth;
-        const h = canvas.clientHeight;
-        const cols = Math.max(76, Math.floor(w / 18));
-        const rows = Math.max(18, Math.floor(h / 46));
-        const hostSources = hosts.length
-            ? hosts
-            : [{ id: "idle", intensity: 0.18 }, { id: "idle-2", intensity: 0.12 }];
-        const grid = [];
-        for (let j = 0; j < rows; j += 1) {
-            const row = [];
-            for (let i = 0; i < cols; i += 1) {
-                const nx = -0.45 + (i / (cols - 1)) * 1.9;
-                const ny = j / (rows - 1);
-                let z = 0;
-                let influence = 0;
-                hostSources.forEach((host, index) => {
-                    const cx = hostSources.length <= 1 ? 0.5 : index / Math.max(hostSources.length - 1, 1);
-                    const cy = 0.5 + 0.1 * Math.sin(index * 1.25);
-                    const rawIntensity = Math.max(0, Number(host.intensity || 0));
-                    const peakCurve = rawIntensity <= 0.5 ? 0 : Math.pow((rawIntensity - 0.5) / 0.5, 0.62);
-                    const intensity = rawIntensity <= 0.5 ? rawIntensity : 0.5 + peakCurve * 0.95;
-                    const dx = nx - cx;
-                    const dy = ny - cy;
-                    const bump = Math.exp(-(dx * dx / 0.01 + dy * dy / 0.048));
-                    influence += bump;
-                    z += bump * (8 + 92 * intensity + peakCurve * 145);
-                });
-                z += Math.sin(time * 0.0018 + i * 0.28 + j * 0.18) * 1.6;
-                const x = w * 0.5 + (nx - 0.5) * w * 0.86 + (j - rows / 2) * 11.2;
-                const y = h * 0.62 + (j - rows / 2) * Math.max(7.2, h * 0.011) - z;
-                row.push({ x, y, z, influence });
-            }
-            grid.push(row);
-        }
-        for (let j = 0; j < rows - 1; j += 1) {
-            for (let i = 0; i < cols - 1; i += 1) {
-                const p = grid[j][i];
-                const p2 = grid[j][i + 1];
-                const p3 = grid[j + 1][i + 1];
-                const p4 = grid[j + 1][i];
-                const influence = Math.min((p.influence + p2.influence + p3.influence + p4.influence) / 2.6, 1);
-                const shade = Math.min((p.z + p2.z + p3.z + p4.z) / 280, 1);
-                const alpha = Math.min(0.025 + influence * 0.13 + shade * 0.28, 0.62);
-                if (alpha <= 0.002) {
-                    continue;
-                }
-                ctx.fillStyle = `rgba(${170 + shade * 64}, ${208 + shade * 26}, ${248 - shade * 10}, ${alpha})`;
-                ctx.strokeStyle = `rgba(46, 49, 146, ${0.035 + influence * 0.17 + shade * 0.12})`;
-                ctx.lineWidth = 0.5 + shade * 0.38;
-                ctx.beginPath();
-                ctx.moveTo(p.x, p.y);
-                ctx.lineTo(p2.x, p2.y);
-                ctx.lineTo(p3.x, p3.y);
-                ctx.lineTo(p4.x, p4.y);
-                ctx.closePath();
-                ctx.fill();
-                ctx.stroke();
-            }
-        }
-    };
-
-    const draw = (time) => {
-        const w = canvas.clientWidth;
-        const h = canvas.clientHeight;
-        ctx.clearRect(0, 0, w, h);
-        const bg = ctx.createLinearGradient(0, 0, w, h);
-        bg.addColorStop(0, "rgba(248,250,255,0.6)");
-        bg.addColorStop(0.55, "rgba(238,245,255,0.18)");
-        bg.addColorStop(1, "rgba(229,239,252,0.52)");
-        ctx.fillStyle = bg;
-        ctx.fillRect(0, 0, w, h);
-        drawSurface(time);
-        requestAnimationFrame(draw);
-    };
-
-    resize();
-    requestAnimationFrame(draw);
-    window.addEventListener("resize", resize);
-})();
-</script>
 {% endblock %}

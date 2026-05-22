@@ -67,6 +67,19 @@ def _promote_dynamic_to_stable(cache: HostStatusCache) -> None:
     cache.refresh_completed_at = cache.refreshed_at
 
 
+def _docker_info_with_root_disk(docker: DockerService, timeout: int) -> dict:
+    docker_info = docker.docker_info(timeout=timeout)
+    try:
+        docker_info["_root_disk_usage"] = docker.filesystem_usage_gb("/", timeout=timeout)
+    except Exception:
+        docker_info["_root_disk_usage"] = {}
+    try:
+        docker_info["_workspace_disk_usage"] = docker.filesystem_usage_gb(docker.host.workspace_root, timeout=timeout)
+    except Exception:
+        docker_info["_workspace_disk_usage"] = {}
+    return docker_info
+
+
 def schedule_host_refresh(host_id: int, full: bool = False) -> bool:
     with _refresh_lock:
         if host_id in _refreshing_hosts:
@@ -101,7 +114,7 @@ def refresh_host_status_cache_once(host_id: int) -> None:
             reachable = docker.ping(timeout=4)
             cache.reachable = reachable
             if reachable:
-                docker_info = docker.docker_info(timeout=6)
+                docker_info = _docker_info_with_root_disk(docker, timeout=6)
                 container_rows = docker.managed_container_rows(host.port_start, host.port_end, timeout=8)
                 stats = docker.list_container_stats(timeout=8)
                 gpus = docker.gpu_stats(timeout=6)
@@ -128,7 +141,6 @@ def refresh_host_status_cache_once(host_id: int) -> None:
     finally:
         db.close()
 
-
 def refresh_host_status_cache_fast(host_id: int) -> None:
     db = SessionLocal()
     try:
@@ -149,7 +161,7 @@ def refresh_host_status_cache_fast(host_id: int) -> None:
             reachable = docker.ping(timeout=3)
             cache.reachable = reachable
             if reachable:
-                docker_info = docker.docker_info(timeout=4)
+                docker_info = _docker_info_with_root_disk(docker, timeout=4)
                 stats = docker.list_container_stats(timeout=5)
                 gpus = docker.gpu_stats(timeout=4)
                 container_rows = docker.managed_container_rows(host.port_start, host.port_end, timeout=5)
@@ -175,16 +187,3 @@ def refresh_host_status_cache_fast(host_id: int) -> None:
         db.rollback()
     finally:
         db.close()
-
-
-def refresh_all_host_status_cache() -> None:
-    db = SessionLocal()
-    try:
-        host_ids = [
-            item.id
-            for item in db.query(ManagedHost.id).filter(ManagedHost.enabled == True).all()  # noqa: E712
-        ]
-    finally:
-        db.close()
-    for host_id in host_ids:
-        refresh_host_status_cache_once(host_id)

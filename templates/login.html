@@ -1,7 +1,14 @@
 {% extends "base.html" %}
 
 {% block content %}
+{% set login_visual_theme = "admin" %}
+{% include "login_visual.html" %}
+
 <section class="panel auth-panel">
+    <a class="login-switch-button" href="/user-login" aria-label="切换登录形式：使用者登录" title="切换登录形式：使用者登录">
+        <span aria-hidden="true">⇄</span>
+        <em>切换登录形式</em>
+    </a>
     <div class="panel-head">
         <div>
             <p class="eyebrow">管理员登录</p>
@@ -19,7 +26,6 @@
         <label><span class="required-mark">*</span>密码<input name="password" type="password" required></label>
         <div class="wide action-row">
             <button class="button" type="submit">管理员登录</button>
-            <a class="button secondary" href="/user-login">使用者登录</a>
             <a class="button secondary" href="/register">注册管理员账号</a>
         </div>
     </form>

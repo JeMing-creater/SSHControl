@@ -42,11 +42,94 @@
         </div>
         <div class="compute-overview-kpis">
             <span><strong>{{ summary.container_count }}</strong> 个容器</span>
-            <span><strong>{{ "%.0f"|format(resource_chart_rows | sum(attribute="gpu_memory_used_mb")) }}</strong> MB 显存</span>
+            <span><strong>{{ "%.1f"|format((resource_chart_rows | sum(attribute="gpu_memory_used_mb")) / 1024) }}</strong> GB 显存</span>
         </div>
     </div>
     <canvas id="host-visual-canvas" width="1400" height="420"></canvas>
+    <div class="resource-flow-shell">
+        <div class="resource-flow-head">
+            <div>
+                <p class="eyebrow">资源占用流</p>
+                <h4>四项资源独立实时波动</h4>
+            </div>
+        </div>
+        <div class="resource-flow-grid">
+            <article class="resource-flow-card gpu" data-resource-flow-card="gpu">
+                <div class="resource-flow-card-head">
+                    <span class="resource-flow-title">显存 <span class="resource-flow-total">(<b data-flow-total="gpu">-</b>)</span></span>
+                    <small><i></i>实时更新</small>
+                </div>
+                <canvas data-resource-flow="gpu" width="680" height="170"></canvas>
+                <div class="resource-flow-stats">
+                    <span><em>平台可分配上限</em><strong data-flow-allocated="gpu">-</strong></span>
+                    <span><em>已登记分配</em><strong data-flow-reserved="gpu">-</strong></span>
+                </div>
+            </article>
+            <article class="resource-flow-card cpu" data-resource-flow-card="cpu">
+                <div class="resource-flow-card-head">
+                    <span class="resource-flow-title">CPU <span class="resource-flow-total">(<b data-flow-total="cpu">-</b>)</span></span>
+                    <small><i></i>实时更新</small>
+                </div>
+                <canvas data-resource-flow="cpu" width="680" height="170"></canvas>
+                <div class="resource-flow-stats">
+                    <span><em>平台可分配上限</em><strong data-flow-allocated="cpu">-</strong></span>
+                    <span><em>已登记分配</em><strong data-flow-reserved="cpu">-</strong></span>
+                </div>
+            </article>
+            <article class="resource-flow-card memory" data-resource-flow-card="memory">
+                <div class="resource-flow-card-head">
+                    <span class="resource-flow-title">内存 <span class="resource-flow-total">(<b data-flow-total="memory">-</b>)</span></span>
+                    <small><i></i>实时更新</small>
+                </div>
+                <canvas data-resource-flow="memory" width="680" height="170"></canvas>
+                <div class="resource-flow-stats">
+                    <span><em>平台可分配上限</em><strong data-flow-allocated="memory">-</strong></span>
+                    <span><em>已登记分配</em><strong data-flow-reserved="memory">-</strong></span>
+                </div>
+            </article>
+            <article class="resource-flow-card disk" data-resource-flow-card="disk">
+                <div class="resource-flow-card-head">
+                    <span class="resource-flow-title">硬盘 <span class="resource-flow-total">(<b data-flow-total="disk">-</b>)</span></span>
+                    <small><i></i>实时更新</small>
+                </div>
+                <canvas data-resource-flow="disk" width="680" height="170"></canvas>
+                <div class="resource-flow-stats">
+                    <span><em>平台可分配上限</em><strong data-flow-allocated="disk">-</strong></span>
+                    <span><em>已登记分配</em><strong data-flow-reserved="disk">-</strong></span>
+                </div>
+            </article>
+        </div>
+    </div>
 </section>
+
+{% if is_user_view %}
+<section class="panel">
+    <div class="panel-head chart-head">
+        <div>
+            <p class="eyebrow">资源排行榜</p>
+            <h3>按端口查看实时占用排序</h3>
+            <p class="muted">可切换 CPU、内存、显卡显存和 Docker 磁盘占用，快速定位最重的端口。</p>
+            <p id="resource-monitor-state" class="monitor-state">实时监控准备中</p>
+        </div>
+        <div class="chart-toolbar">
+            <label>排序维度
+                <select id="resource-sort-key">
+                    <option value="gpu">显卡资源</option>
+                    <option value="cpu">CPU</option>
+                    <option value="memory">内存资源</option>
+                    <option value="disk">硬盘资源</option>
+                </select>
+            </label>
+            <button class="button tiny secondary" type="button" id="resource-toggle">展开全部</button>
+        </div>
+    </div>
+    <div class="resource-chart-panel">
+        <div id="resource-chart-empty" class="empty-state hidden">当前没有可展示的端口资源数据。</div>
+        <div id="resource-chart" class="resource-chart"></div>
+    </div>
+</section>
+{% endif %}
+
 <section id="toast" class="toast hidden" aria-live="polite">
     <div id="toast-body" class="toast-body"></div>
 </section>
@@ -179,53 +262,8 @@
     </div>
 </section>
 
-<section class="grid cards three">
-    {% if not is_user_view %}
-    <article class="card">
-        <p class="eyebrow">准入状态</p>
-        <h3>{{ 'Docker 在线' if summary.reachable else 'Docker 不可达' }}</h3>
-        <p class="muted">保底预留 {{ host.reserve_cpu_cores }} 核 / {{ host.reserve_memory_gb }} GB</p>
-    </article>
-    <article class="card">
-        <p class="eyebrow">默认建议值</p>
-        <h3>{{ defaults.cpu_limit_cores }} 核 / {{ defaults.memory_limit_gb }} GB</h3>
-        <p class="muted">默认 /workspace 上限 {{ defaults.workspace_limit_gb }} GB</p>
-    </article>
-    <article class="card">
-        <p class="eyebrow">快照策略</p>
-        <h3>{{ host.snapshot_keep_count }} 份保留</h3>
-        <p class="muted">
-            {% if host.snapshot_keep_count > 0 %}
-            自动快照间隔 {{ host.snapshot_interval_days }} 天
-            {% else %}
-            当前未启用自动快照
-            {% endif %}
-        </p>
-        <form class="inline-form stack async-form" method="post" action="/hosts/{{ host.id }}/snapshot-policy">
-            <label>备份保留数量
-                <select name="snapshot_keep_count">
-                    <option value="0" {% if host.snapshot_keep_count == 0 %}selected{% endif %}>0 - 不自动备份</option>
-                    <option value="1" {% if host.snapshot_keep_count == 1 %}selected{% endif %}>1</option>
-                    <option value="2" {% if host.snapshot_keep_count == 2 %}selected{% endif %}>2</option>
-                    <option value="3" {% if host.snapshot_keep_count == 3 %}selected{% endif %}>3</option>
-                    <option value="4" {% if host.snapshot_keep_count == 4 %}selected{% endif %}>4</option>
-                    <option value="5" {% if host.snapshot_keep_count == 5 %}selected{% endif %}>5</option>
-                    <option value="6" {% if host.snapshot_keep_count == 6 %}selected{% endif %}>6</option>
-                    <option value="8" {% if host.snapshot_keep_count == 8 %}selected{% endif %}>8</option>
-                    <option value="10" {% if host.snapshot_keep_count == 10 %}selected{% endif %}>10</option>
-                </select>
-            </label>
-            <label>备份周期(天)
-                <input name="snapshot_interval_days" type="number" min="1" value="{{ host.snapshot_interval_days }}">
-            </label>
-            <button class="button tiny async-submit-button" type="submit">更新快照策略</button>
-        </form>
-    </article>
-    {% endif %}
-</section>
-
 {% if not is_user_view %}
-<section class="split wide-left">
+<section class="split wide-left host-management-grid">
     <article class="panel">
         <div class="panel-head">
             <div>
@@ -246,7 +284,7 @@
             </label>
             <label><span class="required-mark">*</span>使用者<input id="assignee" name="assignee" required></label>
             <label><span class="required-mark">*</span>root 密码<input name="root_password" required></label>
-            <label><span class="required-mark">*</span>CPU 上限<input name="cpu_limit_cores" type="number" step="1" value="{{ defaults.cpu_limit_cores|int }}"></label>
+            <label><span class="required-mark">*</span>CPU 上限(核)<input name="cpu_limit_cores" type="number" step="1" value="{{ defaults.cpu_limit_cores|int }}"></label>
             <label><span class="required-mark">*</span>内存上限(GB)<input name="memory_limit_gb" type="number" step="1" value="{{ defaults.memory_limit_gb|int }}"></label>
             <label><span class="required-mark">*</span>/workspace 上限(GB)<input name="workspace_limit_gb" type="number" step="1" value="{{ defaults.workspace_limit_gb|int }}"></label>
             <label class="wide"><span class="required-mark">*</span>使用目的<textarea name="purpose" rows="2" required>实验计算</textarea></label>
@@ -275,30 +313,67 @@
         </form>
     </article>
 
-    <article class="panel">
-        <div class="panel-head">
-            <div>
-                <p class="eyebrow">GPU 总览</p>
-                <h3>整机共享 GPU</h3>
-            </div>
-        </div>
-        <div class="gpu-list stacked">
-            {% for gpu in summary.gpus %}
-            <div class="gpu-chip large">
+    <div class="host-side-stack">
+        <article class="panel snapshot-policy-panel">
+            <div class="panel-head">
                 <div>
-                    <strong>GPU {{ gpu.index }}</strong>
-                    <p>{{ gpu.name }}</p>
-                </div>
-                <div>
-                    <strong>{{ gpu.utilization_gpu }}%</strong>
-                    <p>{{ gpu.memory_used_mb|int }} / {{ gpu.memory_total_mb|int }} MB</p>
+                    <p class="eyebrow">快照策略</p>
+                    <h3>{{ host.snapshot_keep_count }} 份保留</h3>
+                    <p class="muted">
+                        {% if host.snapshot_keep_count > 0 %}
+                        自动快照间隔 {{ host.snapshot_interval_days }} 天
+                        {% else %}
+                        当前未启用自动快照
+                        {% endif %}
+                    </p>
                 </div>
             </div>
-            {% else %}
-            <p class="muted">未获取到 GPU 状态</p>
-            {% endfor %}
-        </div>
-    </article>
+            <form class="form-grid async-form" method="post" action="/hosts/{{ host.id }}/snapshot-policy">
+                <label>备份保留数量
+                    <select name="snapshot_keep_count">
+                        <option value="0" {% if host.snapshot_keep_count == 0 %}selected{% endif %}>0 - 不自动备份</option>
+                        <option value="1" {% if host.snapshot_keep_count == 1 %}selected{% endif %}>1</option>
+                        <option value="2" {% if host.snapshot_keep_count == 2 %}selected{% endif %}>2</option>
+                        <option value="3" {% if host.snapshot_keep_count == 3 %}selected{% endif %}>3</option>
+                        <option value="4" {% if host.snapshot_keep_count == 4 %}selected{% endif %}>4</option>
+                        <option value="5" {% if host.snapshot_keep_count == 5 %}selected{% endif %}>5</option>
+                        <option value="6" {% if host.snapshot_keep_count == 6 %}selected{% endif %}>6</option>
+                        <option value="8" {% if host.snapshot_keep_count == 8 %}selected{% endif %}>8</option>
+                        <option value="10" {% if host.snapshot_keep_count == 10 %}selected{% endif %}>10</option>
+                    </select>
+                </label>
+                <label>备份周期(天)
+                    <input name="snapshot_interval_days" type="number" min="1" value="{{ host.snapshot_interval_days }}">
+                </label>
+                <button class="button async-submit-button" type="submit">更新快照策略</button>
+            </form>
+        </article>
+
+        <article class="panel gpu-summary-panel">
+            <div class="panel-head">
+                <div>
+                    <p class="eyebrow">GPU 总览</p>
+                    <h3>整机共享 GPU</h3>
+                </div>
+            </div>
+            <div class="gpu-list stacked">
+                {% for gpu in summary.gpus %}
+                <div class="gpu-chip large">
+                    <div>
+                        <strong>GPU {{ gpu.index }}</strong>
+                        <p>{{ gpu.name }}</p>
+                    </div>
+                    <div>
+                        <strong>{{ gpu.utilization_gpu }}%</strong>
+                        <p>{{ gpu.memory_used_mb|int }} / {{ gpu.memory_total_mb|int }} MB</p>
+                    </div>
+                </div>
+                {% else %}
+                <p class="muted">未获取到 GPU 状态</p>
+                {% endfor %}
+            </div>
+        </article>
+    </div>
 </section>
 {% else %}
 <section class="panel">
@@ -327,6 +402,7 @@
 </section>
 {% endif %}
 
+{% if not is_user_view %}
 <section class="panel">
     <div class="panel-head chart-head">
         <div>
@@ -352,6 +428,7 @@
         <div id="resource-chart" class="resource-chart"></div>
     </div>
 </section>
+{% endif %}
 
 <section class="panel">
     <div class="panel-head">
@@ -1001,10 +1078,51 @@ window.addEventListener("DOMContentLoaded", () => {
 
 (() => {
     let resourceChartRows = {{ resource_chart_rows | tojson }};
+    const resourceFlowGpus = {{ summary.get('gpus', []) | tojson }};
+    const resourceFlowPhysical = {
+        gpu: Array.isArray(resourceFlowGpus)
+            ? resourceFlowGpus.reduce((total, gpu) => total + Number(gpu.memory_total_mb || 0), 0) / 1024
+            : 0,
+        cpu: Number({{ (summary.get('total_cpu_cores') or 0) | tojson }}),
+        memory: Number({{ (summary.get('total_memory_gb') or 0) | tojson }}),
+        disk: Number({{ (summary.get('workspace_disk_total_gb') or summary.get('root_disk_total_gb') or 0) | tojson }})
+    };
+    const resourceFlowAllocatableRatio = 0.85;
+    const resourceFlowCapacity = {
+        gpu: resourceFlowPhysical.gpu,
+        cpu: resourceFlowPhysical.cpu,
+        memory: resourceFlowPhysical.memory,
+        disk: resourceFlowPhysical.disk
+    };
+    const resourceFlowPlatformLimit = {
+        gpu: resourceFlowPhysical.gpu,
+        cpu: Math.max(resourceFlowPhysical.cpu * resourceFlowAllocatableRatio, 0),
+        memory: Math.max(resourceFlowPhysical.memory * resourceFlowAllocatableRatio, 0),
+        disk: Math.max(resourceFlowPhysical.disk * resourceFlowAllocatableRatio, 0)
+    };
+    let resourceFlowReserved = {
+        gpu: 0,
+        cpu: Number({{ (summary.get('allocated_cpu') or 0) | tojson }}),
+        memory: Number({{ (summary.get('allocated_memory_gb') or 0) | tojson }}),
+        disk: Number({{ (summary.get('allocated_disk_gb') or 0) | tojson }})
+    };
     const resourceSortKey = document.getElementById("resource-sort-key");
     const resourceToggle = document.getElementById("resource-toggle");
     const resourceChart = document.getElementById("resource-chart");
     const resourceChartEmpty = document.getElementById("resource-chart-empty");
+    const resourceFlowCanvases = new Map(
+        [...document.querySelectorAll("[data-resource-flow]")]
+            .map((canvas) => [canvas.dataset.resourceFlow, { canvas, ctx: canvas.getContext("2d") }])
+    );
+    const resourceFlowCards = new Map(
+        [...document.querySelectorAll("[data-resource-flow-card]")]
+            .map((card) => [card.dataset.resourceFlowCard, card])
+    );
+    const resourceFlowValueEls = {
+        total: new Map([...document.querySelectorAll("[data-flow-total]")].map((item) => [item.dataset.flowTotal, item])),
+        allocated: new Map([...document.querySelectorAll("[data-flow-allocated]")].map((item) => [item.dataset.flowAllocated, item])),
+        reserved: new Map([...document.querySelectorAll("[data-flow-reserved]")].map((item) => [item.dataset.flowReserved, item]))
+    };
     const resourceMonitorState = document.getElementById("resource-monitor-state");
     const hostRefreshState = document.getElementById("host-refresh-state");
     const hostLastStatusAt = document.getElementById("host-last-status-at");
@@ -1054,6 +1172,16 @@ window.addEventListener("DOMContentLoaded", () => {
     let metricsInFlight = false;
     let restartAllInFlight = false;
     let restartAllController = null;
+    const resourceFlowState = {
+        cursor: 0,
+        points: [],
+        totals: {
+            gpu: 0,
+            cpu: 0,
+            memory: 0,
+            disk: 0
+        }
+    };
 
     const chartMeta = {
         cpu: {
@@ -1099,6 +1227,275 @@ window.addEventListener("DOMContentLoaded", () => {
             return `${numeric.toFixed(0)} ${unit}`;
         }
         return `${numeric.toFixed(1)} ${unit}`;
+    };
+
+    const flowMeta = {
+        gpu: {
+            label: "显存",
+            unit: "GB",
+            color: "rgba(17, 47, 145, 0.96)",
+            fill: "rgba(17, 47, 145, 0.14)"
+        },
+        cpu: {
+            label: "CPU",
+            unit: "核",
+            color: "rgba(97, 216, 255, 0.98)",
+            fill: "rgba(97, 216, 255, 0.15)"
+        },
+        memory: {
+            label: "内存",
+            unit: "GB",
+            color: "rgba(182, 167, 255, 0.96)",
+            fill: "rgba(182, 167, 255, 0.15)"
+        },
+        disk: {
+            label: "硬盘",
+            unit: "TB",
+            color: "rgba(255, 216, 101, 0.98)",
+            fill: "rgba(255, 216, 101, 0.18)"
+        }
+    };
+
+    const sumRows = (rows, key) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
+
+    const resourceTotalsFromRows = (rows) => ({
+        gpu: sumRows(rows, "gpu_memory_used_mb") / 1024,
+        cpu: sumRows(rows, "cpu_percent") / 100,
+        memory: sumRows(rows, "memory_used_gb"),
+        disk: sumRows(rows, "disk_used_gb")
+    });
+
+    const formatFlowValue = (value, key, mode = "current") => {
+        const meta = flowMeta[key] || {};
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) {
+            return "-";
+        }
+        if (key === "cpu") {
+            return `${numeric.toFixed(1)} 核`;
+        }
+        if (key === "disk") {
+            return `${(numeric / 1024).toFixed(2)} TB`;
+        }
+        return `${numeric.toFixed(1)} ${meta.unit || ""}`;
+    };
+
+    const isResourceNearLimit = (key, value) => {
+        const limit = Number(resourceFlowPlatformLimit[key] || 0);
+        if (!limit) {
+            return false;
+        }
+        return Number(value || 0) / limit >= 0.9;
+    };
+
+    const updateResourceFlowStats = () => {
+        const totals = resourceFlowState.totals;
+        ["gpu", "cpu", "memory", "disk"].forEach((key) => {
+            const totalValue = key === "cpu" ? resourceFlowPhysical.cpu : resourceFlowPhysical[key];
+            const platformLimit = resourceFlowPlatformLimit[key];
+            const totalEl = resourceFlowValueEls.total.get(key);
+            const allocatedEl = resourceFlowValueEls.allocated.get(key);
+            const reservedEl = resourceFlowValueEls.reserved.get(key);
+            if (!totalEl || !allocatedEl || !reservedEl) {
+                return;
+            }
+            totalEl.textContent = totalValue
+                ? formatFlowValue(totalValue, key, "total")
+                : "-";
+            allocatedEl.textContent = platformLimit
+                ? formatFlowValue(platformLimit, key, "allocated")
+                : "-";
+            reservedEl.textContent = formatFlowValue(resourceFlowReserved[key] || 0, key, "reserved");
+            resourceFlowCards.get(key)?.classList.toggle("is-warning", isResourceNearLimit(key, totals[key]));
+        });
+    };
+
+    const scaleResourceValue = (value, key) => {
+        const fallbackCapacity = {
+            gpu: 320,
+            cpu: 8,
+            memory: 512,
+            disk: 200
+        };
+        const capacity = Number(resourceFlowCapacity[key] || fallbackCapacity[key] || 1);
+        const ratio = Math.max(0, Math.min(Number(value || 0) / Math.max(capacity, 1), 1));
+        return Math.pow(ratio, 0.72);
+    };
+
+    const scaleResourceTotals = (totals) => ({
+        gpu: scaleResourceValue(totals.gpu, "gpu"),
+        cpu: scaleResourceValue(totals.cpu, "cpu"),
+        memory: scaleResourceValue(totals.memory, "memory"),
+        disk: scaleResourceValue(totals.disk, "disk")
+    });
+
+    const resizeResourceFlow = () => {
+        const ratio = window.devicePixelRatio || 1;
+        resourceFlowCanvases.forEach(({ canvas, ctx }) => {
+            if (!canvas || !ctx) {
+                return;
+            }
+            const rect = canvas.getBoundingClientRect();
+            const cssWidth = Math.max(220, Math.floor(rect.width || canvas.parentElement.getBoundingClientRect().width));
+            const cssHeight = Math.max(112, Math.floor(rect.height || 128));
+            canvas.width = Math.floor(cssWidth * ratio);
+            canvas.height = Math.floor(cssHeight * ratio);
+            ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+        });
+    };
+
+    const pushResourceFlowPoint = (totals, force = false) => {
+        resourceFlowState.totals = totals;
+        if (!resourceFlowState.points.length || force) {
+            for (let index = 0; index < 80; index += 1) {
+                resourceFlowState.points.push({ ...totals, seed: index * 0.37 });
+            }
+            updateResourceFlowStats();
+            return;
+        }
+        const last = resourceFlowState.points[resourceFlowState.points.length - 1] || totals;
+        resourceFlowState.points.push({
+            gpu: last.gpu * 0.58 + totals.gpu * 0.42,
+            cpu: last.cpu * 0.58 + totals.cpu * 0.42,
+            memory: last.memory * 0.58 + totals.memory * 0.42,
+            disk: last.disk * 0.58 + totals.disk * 0.42,
+            seed: resourceFlowState.cursor * 0.19
+        });
+        if (resourceFlowState.points.length > 120) {
+            resourceFlowState.points.shift();
+        }
+        updateResourceFlowStats();
+    };
+
+    const drawResourceFlowSeries = (canvas, ctx, points, key, time) => {
+        if (!points.length) {
+            return;
+        }
+        const warning = isResourceNearLimit(key, resourceFlowState.totals[key]);
+        const meta = flowMeta[key];
+        const lineColor = warning ? "rgba(236, 56, 74, 0.98)" : meta.color;
+        const fillColor = warning ? "rgba(236, 56, 74, 0.16)" : meta.fill;
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        const step = w / Math.max(points.length - 1, 1);
+        const scaledPoints = points.map((point, index) => {
+            const scaled = scaleResourceTotals(point)[key] || 0;
+            const wave = Math.sin(time * 0.0016 + index * 0.42 + point.seed) * 0.034;
+            const pulse = Math.sin(time * 0.0009 + index * 0.18) * 0.018;
+            return {
+                x: index * step,
+                y: h * 0.84 - (0.12 + Math.max(0, Math.min(scaled + wave + pulse, 1)) * 0.76) * h * 0.66
+            };
+        });
+        ctx.clearRect(0, 0, w, h);
+
+        const bg = ctx.createLinearGradient(0, 0, 0, h);
+        bg.addColorStop(0, "rgba(255, 255, 255, 0.08)");
+        bg.addColorStop(1, "rgba(46, 49, 146, 0.035)");
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, w, h);
+
+        ctx.save();
+        ctx.strokeStyle = "rgba(46, 49, 146, 0.055)";
+        ctx.lineWidth = 1;
+        const drift = (time * 0.012) % 22;
+        for (let x = -22 + drift; x < w + 22; x += 22) {
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, h);
+            ctx.stroke();
+        }
+        for (let y = 18; y < h; y += 24) {
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(w, y);
+            ctx.stroke();
+        }
+        ctx.restore();
+
+        const baseline = h * 0.88;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(scaledPoints[0].x, baseline);
+        scaledPoints.forEach((point, index) => {
+            if (index === 0) {
+                ctx.lineTo(point.x, point.y);
+                return;
+            }
+            const previous = scaledPoints[index - 1];
+            const cx = (previous.x + point.x) / 2;
+            ctx.quadraticCurveTo(previous.x, previous.y, cx, (previous.y + point.y) / 2);
+        });
+        const last = scaledPoints[scaledPoints.length - 1];
+        ctx.lineTo(last.x, last.y);
+        ctx.lineTo(w, baseline);
+        ctx.closePath();
+        ctx.fillStyle = fillColor;
+        ctx.fill();
+
+        ctx.beginPath();
+        scaledPoints.forEach((point, index) => {
+            if (index === 0) {
+                ctx.moveTo(point.x, point.y);
+                return;
+            }
+            const previous = scaledPoints[index - 1];
+            const cx = (previous.x + point.x) / 2;
+            ctx.quadraticCurveTo(previous.x, previous.y, cx, (previous.y + point.y) / 2);
+        });
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = 2.3;
+        ctx.shadowColor = lineColor;
+        ctx.shadowBlur = 12;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        for (let index = 0; index < scaledPoints.length; index += 8) {
+            const point = scaledPoints[index];
+            ctx.fillStyle = lineColor;
+            ctx.beginPath();
+            ctx.arc(point.x, point.y, 1.6, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        const current = scaledPoints[scaledPoints.length - 1];
+        ctx.fillStyle = lineColor;
+        ctx.beginPath();
+        ctx.arc(current.x, current.y, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        const currentText = formatFlowValue(resourceFlowState.totals[key], key, "current");
+        const label = `实况 ${currentText}`;
+        const textX = Math.max(8, Math.min(w - 6, current.x - 86));
+        const textY = Math.max(16, Math.min(h - 12, current.y - 10));
+        ctx.font = '700 12px "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", sans-serif';
+        ctx.fillStyle = warning ? "rgba(204, 31, 52, 0.96)" : "rgba(17, 27, 69, 0.88)";
+        ctx.fillText(label, textX, textY);
+
+        const scanX = (time * 0.04) % (w + 64) - 32;
+        const scan = ctx.createLinearGradient(scanX - 28, 0, scanX + 28, 0);
+        scan.addColorStop(0, "rgba(255,255,255,0)");
+        scan.addColorStop(0.5, "rgba(255,255,255,0.28)");
+        scan.addColorStop(1, "rgba(255,255,255,0)");
+        ctx.fillStyle = scan;
+        ctx.fillRect(scanX - 28, 0, 56, h);
+        ctx.restore();
+    };
+
+    const drawResourceFlow = (time) => {
+        if (!resourceFlowCanvases.size) {
+            return;
+        }
+        resourceFlowState.cursor += 1;
+        if (resourceFlowState.cursor % 54 === 0) {
+            pushResourceFlowPoint(resourceFlowState.totals);
+        }
+        const points = resourceFlowState.points;
+        resourceFlowCanvases.forEach(({ canvas, ctx }, key) => {
+            drawResourceFlowSeries(canvas, ctx, points, key, time + (key.length * 230));
+        });
+
+        requestAnimationFrame(drawResourceFlow);
     };
 
     const formatGpuDetail = (items) => {
@@ -1192,7 +1589,35 @@ window.addEventListener("DOMContentLoaded", () => {
             memory_limit_gb: Number(row.memory_limit_gb || 0),
             workspace_limit_gb: Number(row.workspace_limit_gb || 0),
         }));
+        pushResourceFlowPoint(resourceTotalsFromRows(resourceChartRows));
     };
+
+    const mergeAllocatedTotals = (allocated) => {
+        if (!allocated || typeof allocated !== "object") {
+            resourceFlowReserved = {
+                gpu: resourceTotalsFromRows(resourceChartRows).gpu,
+                cpu: sumRows(resourceChartRows, "cpu_limit_cores"),
+                memory: sumRows(resourceChartRows, "memory_limit_gb"),
+                disk: sumRows(resourceChartRows, "workspace_limit_gb")
+            };
+            updateResourceFlowStats();
+            return;
+        }
+        resourceFlowReserved = {
+            gpu: Number(allocated.gpu || 0),
+            cpu: Number(allocated.cpu || 0),
+            memory: Number(allocated.memory || 0),
+            disk: Number(allocated.disk || 0)
+        };
+        updateResourceFlowStats();
+    };
+
+    pushResourceFlowPoint(resourceTotalsFromRows(resourceChartRows), true);
+    mergeAllocatedTotals();
+    updateResourceFlowStats();
+    resizeResourceFlow();
+    requestAnimationFrame(drawResourceFlow);
+    window.addEventListener("resize", resizeResourceFlow);
 
     const refreshMetrics = async () => {
         if (metricsInFlight || document.hidden) {
@@ -1230,6 +1655,7 @@ window.addEventListener("DOMContentLoaded", () => {
             }
             if (response.ok && payload.ok) {
                 mergeMetricRows(payload.rows || []);
+                mergeAllocatedTotals(payload.allocated);
                 renderResourceChart();
                 if (window.updateHostVisualHeatRows) {
                     window.updateHostVisualHeatRows(resourceChartRows);
@@ -1429,7 +1855,11 @@ window.addEventListener("DOMContentLoaded", () => {
                     { reloadOnClose: true }
                 );
             } else {
-                showFeedbackModal(payload.message || detailText || "容器创建失败。", "error");
+                showFeedbackModal(
+                    payload.message || detailText || "容器创建失败。",
+                    "error",
+                    payload.error_log || detailText || ""
+                );
             }
         } catch (error) {
             showFeedbackModal("创建请求发送失败，请检查网络或后端状态。", "error");
@@ -1847,6 +2277,9 @@ window.addEventListener("DOMContentLoaded", () => {
                         "",
                         { reloadOnClose: true }
                     );
+                    if (asyncForm.action.includes("/resources")) {
+                        refreshMetrics();
+                    }
                 } else {
                     showFeedbackModal(
                         payload.message || "操作失败。",

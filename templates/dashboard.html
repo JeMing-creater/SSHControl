@@ -359,18 +359,29 @@
             const x = w * 0.29 + lane * w * 0.42;
             const y = h * (0.48 + 0.12 * Math.sin(index * 1.25));
             const intensity = Math.max(0, Number(host.intensity || 0));
-            if (intensity <= 0.02) {
+            if (intensity <= 0.08) {
                 return;
             }
             const peakBoost = intensity > 0.5 ? Math.pow((intensity - 0.5) / 0.5, 0.62) : 0;
-            const glow = ctx.createRadialGradient(x, y - 94 * intensity, 0, x, y - 94 * intensity, 82 + intensity * 50 + peakBoost * 30);
-            glow.addColorStop(0, `rgba(186, 224, 255, ${0.34 + intensity * 0.32 + peakBoost * 0.24})`);
-            glow.addColorStop(0.34, `rgba(13, 127, 196, ${0.18 + intensity * 0.16 + peakBoost * 0.16})`);
+            const visible = Math.max(0, Math.min((intensity - 0.08) / 0.92, 1));
+            const glowX = x;
+            const glowY = y - 38 - intensity * 58 - peakBoost * 34;
+            const glowWidth = 88 + intensity * 122 + peakBoost * 82;
+            const glowHeight = 16 + intensity * 34 + peakBoost * 24;
+            const glowAlpha = Math.min(0.055 + visible * 0.13 + peakBoost * 0.08, 0.24);
+            const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+            glow.addColorStop(0, `rgba(190, 226, 255, ${glowAlpha})`);
+            glow.addColorStop(0.42, `rgba(95, 172, 230, ${glowAlpha * 0.52})`);
             glow.addColorStop(1, "rgba(13, 127, 196, 0)");
+            ctx.save();
+            ctx.globalCompositeOperation = "screen";
+            ctx.translate(glowX, glowY);
+            ctx.scale(glowWidth, glowHeight);
             ctx.fillStyle = glow;
             ctx.beginPath();
-            ctx.arc(x, y - 94 * intensity, 84 + intensity * 56 + peakBoost * 18, 0, Math.PI * 2);
+            ctx.arc(0, 0, 1, 0, Math.PI * 2);
             ctx.fill();
+            ctx.restore();
         });
         ctx.restore();
     };

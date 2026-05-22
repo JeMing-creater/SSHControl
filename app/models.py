@@ -59,9 +59,9 @@ class ManagedHost(TimestampMixin, Base):
         String(255),
         default="/mnt/docker_platform_snapshots",
     )
-    reserve_cpu_cores: Mapped[float] = mapped_column(Float, default=8.0)
-    reserve_memory_gb: Mapped[float] = mapped_column(Float, default=64.0)
-    reserve_disk_gb: Mapped[float] = mapped_column(Float, default=200.0)
+    reserve_cpu_cores: Mapped[float] = mapped_column(Float, default=0.0)
+    reserve_memory_gb: Mapped[float] = mapped_column(Float, default=0.0)
+    reserve_disk_gb: Mapped[float] = mapped_column(Float, default=0.0)
     default_user_share: Mapped[int] = mapped_column(Integer, default=10)
     snapshot_keep_count: Mapped[int] = mapped_column(Integer, default=2)
     snapshot_interval_days: Mapped[int] = mapped_column(Integer, default=14)

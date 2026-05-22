@@ -220,6 +220,16 @@ code {
     color: var(--muted);
 }
 
+.form-note {
+    padding: 10px 12px;
+    border: 1px solid rgba(46, 49, 146, 0.12);
+    border-radius: 10px;
+    background: rgba(232, 240, 255, 0.55);
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.55;
+}
+
 .hero,
 .panel,
 .card,
@@ -273,6 +283,29 @@ code {
     grid-template-columns: 1.5fr 1fr;
 }
 
+.host-management-grid {
+    align-items: start;
+}
+
+.host-side-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    min-width: 0;
+}
+
+.host-side-stack .panel {
+    min-width: 0;
+}
+
+.snapshot-policy-panel .form-grid {
+    gap: 12px;
+}
+
+.gpu-summary-panel .panel-head {
+    margin-bottom: 12px;
+}
+
 .card,
 .panel {
     padding: 22px;
@@ -283,6 +316,45 @@ code {
     margin: 48px auto;
     position: relative;
     z-index: 1;
+    padding-top: 24px;
+}
+
+.auth-panel .panel-head {
+    padding-right: 118px;
+}
+
+.login-switch-button {
+    position: absolute;
+    top: 22px;
+    right: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 800;
+    transition: transform 0.16s ease, color 0.16s ease, opacity 0.16s ease;
+}
+
+.login-switch-button span {
+    font-size: 0.78rem;
+    font-weight: 900;
+    line-height: 1;
+}
+
+.login-switch-button em {
+    font-style: normal;
+    font-size: 0.84rem;
+    line-height: 1;
+    white-space: nowrap;
+}
+
+.login-switch-button:hover,
+.login-switch-button:focus-visible {
+    outline: none;
+    transform: translateY(-1px);
+    color: var(--accent-2);
 }
 
 .login-visual-shell {
@@ -408,6 +480,40 @@ code {
     color: var(--muted);
 }
 
+.gpu-summary-panel .gpu-list {
+    gap: 7px;
+    margin-bottom: 0;
+}
+
+.gpu-summary-panel .gpu-chip {
+    padding: 7px 9px;
+    border-radius: 10px;
+    min-width: 0;
+}
+
+.gpu-summary-panel .gpu-chip.large {
+    gap: 8px;
+}
+
+.gpu-summary-panel .gpu-chip strong {
+    font-size: 0.95rem;
+    line-height: 1.1;
+}
+
+.gpu-summary-panel .gpu-chip p {
+    margin-top: 2px;
+    font-size: 0.78rem;
+    line-height: 1.18;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.gpu-summary-panel .gpu-chip > div:last-child {
+    flex: 0 0 auto;
+    text-align: right;
+}
+
 .status,
 .tag {
     display: inline-flex;
@@ -511,6 +617,24 @@ code {
     display: flex;
     justify-content: flex-end;
     gap: 12px;
+}
+
+.feedback-progress {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+}
+
+.feedback-progress .progress-bar {
+    height: 10px;
+}
+
+.feedback-progress p {
+    margin: 0;
+    min-width: 48px;
+    text-align: right;
+    font-weight: 700;
 }
 
 .progress-wrap {
@@ -730,6 +854,7 @@ textarea {
 .action-row {
     display: flex;
     flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 8px;
     margin-top: 10px;
 }
@@ -1173,6 +1298,208 @@ textarea {
     background: transparent;
 }
 
+.resource-flow-shell {
+    margin-top: 6px;
+    padding: 14px 16px 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(46, 49, 146, 0.08);
+    background: linear-gradient(180deg, rgba(251, 252, 255, 0.72), rgba(238, 245, 255, 0.48));
+}
+
+.resource-flow-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+    align-items: flex-start;
+    margin-bottom: 8px;
+}
+
+.resource-flow-head h4 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.resource-flow-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.resource-flow-card {
+    position: relative;
+    overflow: hidden;
+    min-width: 0;
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(46, 49, 146, 0.08);
+    background: rgba(255, 255, 255, 0.62);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.82);
+    transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.resource-flow-card.is-warning {
+    border-color: rgba(236, 56, 74, 0.62);
+    box-shadow:
+        0 0 0 1px rgba(236, 56, 74, 0.14),
+        0 0 22px rgba(236, 56, 74, 0.2),
+        inset 0 1px 0 rgba(255, 255, 255, 0.82);
+    animation: resource-warning-pulse 1.5s ease-in-out infinite;
+}
+
+.resource-flow-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, var(--flow-soft), transparent 58%);
+    opacity: 0.44;
+    pointer-events: none;
+}
+
+.resource-flow-card.gpu {
+    --flow-color: #112f91;
+    --flow-soft: rgba(17, 47, 145, 0.16);
+}
+
+.resource-flow-card.cpu {
+    --flow-color: #61d8ff;
+    --flow-soft: rgba(97, 216, 255, 0.18);
+}
+
+.resource-flow-card.memory {
+    --flow-color: #b6a7ff;
+    --flow-soft: rgba(182, 167, 255, 0.18);
+}
+
+.resource-flow-card.disk {
+    --flow-color: #ffd865;
+    --flow-soft: rgba(255, 216, 101, 0.2);
+}
+
+.resource-flow-card-head,
+.resource-flow-stats,
+.resource-flow-canvas-wrap,
+.resource-flow-card canvas {
+    position: relative;
+    z-index: 1;
+}
+
+.resource-flow-card-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.resource-flow-title {
+    color: #152151;
+    font-size: 1rem;
+    font-weight: 800;
+    min-width: 0;
+}
+
+.resource-flow-title .resource-flow-total {
+    color: rgba(21, 33, 81, 0.72);
+    display: inline-block;
+    font-size: 0.58rem;
+    font-weight: 650;
+    line-height: 1;
+    transform: translateY(-1px);
+    white-space: nowrap;
+}
+
+.resource-flow-title .resource-flow-total b {
+    font: inherit;
+}
+
+.resource-flow-card-head small {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 0.76rem;
+    white-space: nowrap;
+}
+
+.resource-flow-card-head small i {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: var(--flow-color);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--flow-color) 40%, transparent);
+    animation: resource-pulse 1.35s ease-out infinite;
+}
+
+.resource-flow-card canvas {
+    display: block;
+    width: 100%;
+    height: 128px;
+    border-radius: 10px;
+    background: transparent;
+}
+
+.resource-flow-stats {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.resource-flow-stats span {
+    min-width: 0;
+    padding: 7px 8px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.68);
+    border: 1px solid rgba(46, 49, 146, 0.065);
+}
+
+.resource-flow-stats em,
+.resource-flow-stats strong {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-style: normal;
+}
+
+.resource-flow-stats em {
+    color: var(--muted);
+    font-size: 0.72rem;
+}
+
+.resource-flow-stats strong {
+    margin-top: 2px;
+    color: #111b45;
+    font-size: 0.86rem;
+}
+
+@keyframes resource-pulse {
+    0% {
+        box-shadow: 0 0 0 0 color-mix(in srgb, var(--flow-color) 40%, transparent);
+    }
+    80%,
+    100% {
+        box-shadow: 0 0 0 8px color-mix(in srgb, var(--flow-color) 0%, transparent);
+    }
+}
+
+@keyframes resource-warning-pulse {
+    0%,
+    100% {
+        box-shadow:
+            0 0 0 1px rgba(236, 56, 74, 0.12),
+            0 0 14px rgba(236, 56, 74, 0.16),
+            inset 0 1px 0 rgba(255, 255, 255, 0.82);
+    }
+    50% {
+        box-shadow:
+            0 0 0 1px rgba(236, 56, 74, 0.28),
+            0 0 34px rgba(236, 56, 74, 0.34),
+            inset 0 1px 0 rgba(255, 255, 255, 0.82);
+    }
+}
+
 @keyframes stripe-flow {
     to {
         background-position: 28px 0;
@@ -1189,6 +1516,20 @@ textarea {
 @media (max-width: 1080px) {
     .split,
     .split.wide-left {
+        grid-template-columns: 1fr;
+    }
+
+    .host-management-grid.split.wide-left {
+        grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.9fr);
+    }
+
+    .resource-flow-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 880px) {
+    .host-management-grid.split.wide-left {
         grid-template-columns: 1fr;
     }
 }
@@ -1221,13 +1562,22 @@ textarea {
     .chart-head,
     .resource-bar-meta,
     .compute-overview-head,
-    .host-visual-head {
+    .host-visual-head,
+    .resource-flow-head {
         flex-direction: column;
         align-items: start;
     }
 
     .compute-overview-kpis {
         justify-content: flex-start;
+    }
+
+    .resource-flow-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .resource-flow-card canvas {
+        height: 118px;
     }
 
     .resource-metric {

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero compact">
+    <div>
+        <p class="eyebrow">服务端异常</p>
+        <h2>{{ message }}</h2>
+        <p class="muted">平台已捕获本次错误，当前页面未继续执行。请根据日志检查原因。</p>
+    </div>
+    <div class="hero-actions">
+        <a class="button secondary" href="/">返回总览</a>
+        {% if request.headers.get('referer') %}
+        <a class="button" href="{{ request.headers.get('referer') }}">返回上一页</a>
+        {% endif %}
+    </div>
+</section>
+
+<section class="banner bad">
+    <strong>{{ message }}</strong>
+    {% if error_log %}
+    <pre class="error-log">{{ error_log }}</pre>
+    {% endif %}
+</section>
+{% endblock %}

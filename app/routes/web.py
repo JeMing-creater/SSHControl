@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import SessionLocal
 from app.models import AdminStatus, AdminUser, Allocation, AllocationStatus, AuthType, HostStatusCache, ManagedHost, SnapshotRecord
-from app.services.admission import check_allocation, recommended_defaults
+from app.services.admission import ACTIVE_STATUSES, check_allocation, recommended_defaults
 from app.services.docker_engine import DockerService, slugify
 from app.services.host_cache import schedule_host_refresh
 from app.services.image_filters import filter_supported_base_images, is_supported_base_image
@@ -30,8 +30,10 @@ from app.services.auth import (
     client_ip,
     password_hash,
     read_session,
+    read_terminal_token,
     send_registration_email,
     sign_session,
+    sign_terminal_token,
     verify_password,
 )
 
@@ -70,13 +72,28 @@ def runner_error_payload(exc: RunnerError, fallback_message: str) -> tuple[str, 
 
 
 def ajax_response(request: Request, ok: bool, message: str, error_log: str = "", status_code: int = 200):
-    accepts_json = "application/json" in (request.headers.get("accept") or "")
-    if request.headers.get("x-requested-with") == "XMLHttpRequest" or accepts_json:
+    if wants_json(request):
         payload = {"ok": ok, "message": message}
         if error_log:
             payload["error_log"] = error_log
         return JSONResponse(payload, status_code=status_code)
     return None
+
+
+def operation_success(request: Request, message: str, redirect_url: str):
+    if wants_json(request):
+        return JSONResponse({"ok": True, "message": message})
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+def operation_error(request: Request, message: str, redirect_url: str, status_code: int = 200):
+    if wants_json(request):
+        summary, error_log = split_error_payload(message)
+        return JSONResponse(
+            {"ok": False, "message": summary, "error_log": error_log},
+            status_code=status_code,
+        )
+    return RedirectResponse(f"{redirect_url}?error={message}", status_code=303)
 
 
 def wants_json(request: Request) -> bool:
@@ -131,6 +148,47 @@ def websocket_client_ip(websocket: WebSocket) -> str:
     if forwarded:
         return forwarded.split(",", 1)[0].strip()
     return websocket.client.host if websocket.client else ""
+
+
+def websocket_cookies(websocket: WebSocket) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    cookie_header = websocket.headers.get("cookie") or ""
+    for chunk in cookie_header.split(";"):
+        if "=" in chunk:
+            key, value = chunk.split("=", 1)
+            cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def read_websocket_session(cookies: dict[str, str], cookie_name: str, websocket: WebSocket) -> str | None:
+    value = cookies.get(cookie_name)
+    account = read_session(value, websocket_client_ip(websocket))
+    if account:
+        return account
+    return read_session(value, None, verify_ip=False)
+
+
+def websocket_admin(cookies: dict[str, str], websocket: WebSocket, db: Session) -> dict | None:
+    account = read_websocket_session(cookies, SESSION_COOKIE, websocket)
+    if not account:
+        return None
+    return admin_from_account(db, account)
+
+
+def admin_from_account(db: Session, account: str | None) -> dict | None:
+    if not account:
+        return None
+    if account == settings.root_admin_account:
+        return {"account": account, "is_root": True}
+    admin_user = db.query(AdminUser).filter(AdminUser.account == account).first()
+    if admin_user and admin_user.status == AdminStatus.APPROVED.value:
+        return {"account": account, "is_root": False}
+    return None
+
+
+def terminal_token_account(websocket: WebSocket, scope: str, resource_id: int) -> str | None:
+    token = websocket.query_params.get("token")
+    return read_terminal_token(token, scope, resource_id)
 
 
 def log_response(lines: list[str], ok: bool = True, message: str = "", error_log: str = "", status_code: int = 200):
@@ -652,7 +710,7 @@ def build_host_rows_from_cached_data(host: ManagedHost, db_allocations: list[All
     }
 
 
-def compute_visual_payload(db: Session, allowed_host_ids: set[int] | None = None) -> dict:
+def compute_visual_payload(db: Session) -> dict:
     hosts = db.query(ManagedHost).filter(ManagedHost.enabled == True).order_by(ManagedHost.name.asc()).all()  # noqa: E712
     rows = []
     total_gpu_used_mb = 0.0
@@ -714,6 +772,22 @@ def compute_visual_payload(db: Session, allowed_host_ids: set[int] | None = None
     }
 
 
+def safe_compute_visual_payload(db: Session) -> dict:
+    try:
+        return compute_visual_payload(db)
+    except Exception:
+        return {
+            "ok": False,
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "host_count": 0,
+            "overall_gpu_percent": 0.0,
+            "total_gpu_used_mb": 0.0,
+            "total_gpu_memory_mb": 0.0,
+            "total_containers": 0,
+            "hosts": [],
+        }
+
+
 def build_ssh_host(
     *,
     name: str,
@@ -728,9 +802,6 @@ def build_ssh_host(
     workspace_root: str,
     shared_mnt_path: str,
     snapshot_root: str,
-    reserve_cpu_cores: float,
-    reserve_memory_gb: float,
-    reserve_disk_gb: float,
     default_user_share: int,
     snapshot_keep_count: int,
     snapshot_interval_days: int,
@@ -750,13 +821,52 @@ def build_ssh_host(
         workspace_root=workspace_root,
         shared_mnt_path=shared_mnt_path,
         snapshot_root=snapshot_root,
-        reserve_cpu_cores=reserve_cpu_cores,
-        reserve_memory_gb=reserve_memory_gb,
-        reserve_disk_gb=reserve_disk_gb,
+        reserve_cpu_cores=0.0,
+        reserve_memory_gb=0.0,
+        reserve_disk_gb=0.0,
         default_user_share=default_user_share,
         snapshot_keep_count=snapshot_keep_count,
         snapshot_interval_days=snapshot_interval_days,
         notes=notes or None,
+    )
+
+
+def build_ssh_host_from_form(
+    *,
+    name: str,
+    address: str,
+    ssh_port: int,
+    ssh_user: str,
+    auth_type: str,
+    ssh_password: str,
+    ssh_key_path: str,
+    port_start: int,
+    port_end: int,
+    workspace_root: str,
+    shared_mnt_path: str,
+    snapshot_root: str,
+    default_user_share: int,
+    snapshot_keep_count: int,
+    snapshot_interval_days: int,
+    notes: str,
+) -> ManagedHost:
+    return build_ssh_host(
+        name=name,
+        address=address,
+        ssh_port=ssh_port,
+        ssh_user=ssh_user,
+        auth_type=auth_type,
+        ssh_password=ssh_password,
+        ssh_key_path=ssh_key_path,
+        port_start=port_start,
+        port_end=port_end,
+        workspace_root=workspace_root,
+        shared_mnt_path=shared_mnt_path,
+        snapshot_root=snapshot_root,
+        default_user_share=default_user_share,
+        snapshot_keep_count=snapshot_keep_count,
+        snapshot_interval_days=snapshot_interval_days,
+        notes=notes,
     )
 
 
@@ -779,8 +889,60 @@ def validate_ssh_docker(host: ManagedHost) -> dict:
     }
 
 
-def make_action_logs(*messages: str) -> list[str]:
-    return [message for message in messages if message]
+def validate_ssh_docker_with_logs(host: ManagedHost, logs: list[str], *, timeout: int = 10) -> dict:
+    docker = DockerService(host)
+    logs.append(f"正在建立 SSH 连接：{host.ssh_user}@{host.address}:{host.ssh_port}")
+    if not docker.ping(timeout=timeout):
+        raise RunnerError("SSH 可连接性或 docker info 检测失败。", command="docker info >/dev/null 2>&1")
+    logs.append("SSH 连接成功，Docker 服务可访问。")
+
+    logs.append("正在读取 Docker 基础信息...")
+    docker_info = docker.docker_info(timeout=timeout)
+    total_memory_gb = float(docker_info.get("MemTotal") or 0) / (1024**3)
+    logs.append(
+        "Docker 信息读取完成："
+        f"{docker_info.get('NCPU') or '-'} 核，"
+        f"{total_memory_gb:.1f} GB 内存，"
+        f"Docker {docker_info.get('ServerVersion') or '-'}。"
+    )
+
+    logs.append(f"正在读取工作目录磁盘容量：{host.workspace_root}")
+    disk_info = docker.filesystem_usage_gb(host.workspace_root, timeout=timeout)
+    if disk_info:
+        logs.append(
+            "磁盘容量读取完成："
+            f"{float(disk_info.get('used_gb') or 0):.1f} / "
+            f"{float(disk_info.get('total_gb') or 0):.1f} GB。"
+        )
+    else:
+        logs.append("未能读取工作目录磁盘容量，继续执行后续检测。")
+
+    logs.append(f"正在扫描端口池占用：{host.port_start}-{host.port_end}")
+    used_ports = docker.used_host_ports(timeout=timeout)
+    available_ports = [
+        port for port in range(host.port_start, host.port_end + 1) if port not in used_ports
+    ]
+    logs.append(f"端口扫描完成：已占用 {len(used_ports)} 个，可分配 {len(available_ports)} 个。")
+
+    logs.append("正在检索本地可用基础镜像...")
+    try:
+        discovered_images = docker.discover_images(timeout=timeout)
+    except RunnerError as exc:
+        discovered_images = []
+        logs.append(f"基础镜像检索失败，已跳过：{exc}")
+    host.cached_images = json.dumps(discovered_images, ensure_ascii=False) if discovered_images else None
+    if discovered_images:
+        logs.append(f"发现 {len(discovered_images)} 个可选基础镜像。")
+    else:
+        logs.append("未发现符合 pytorch:x.x.x-cudax.x-cudnn 格式的基础镜像。")
+
+    return {
+        "docker_info": docker_info,
+        "disk_info": disk_info,
+        "used_ports": sorted(used_ports),
+        "available_ports": available_ports,
+        "images": discovered_images,
+    }
 
 
 def parse_cached_images(raw: str | None) -> list[str]:
@@ -793,6 +955,23 @@ def parse_cached_images(raw: str | None) -> list[str]:
     if not isinstance(value, list):
         return []
     return filter_supported_base_images([str(item).strip() for item in value if str(item).strip()])
+
+
+def resolve_root_disk_usage(host: ManagedHost, docker_info: dict) -> dict:
+    usage = docker_info.get("_root_disk_usage") if isinstance(docker_info, dict) else {}
+    if isinstance(usage, dict) and usage:
+        return usage
+    try:
+        return DockerService(host).filesystem_usage_gb("/", timeout=8)
+    except Exception:
+        return {}
+
+
+def resolve_workspace_disk_usage(docker_info: dict) -> dict:
+    usage = docker_info.get("_workspace_disk_usage") if isinstance(docker_info, dict) else {}
+    if isinstance(usage, dict) and usage:
+        return usage
+    return {}
 
 
 def render_initial_setup(request: Request, message: str = "", error_log: str = ""):
@@ -810,7 +989,19 @@ def render_initial_setup(request: Request, message: str = "", error_log: str = "
 
 @router.get("/login")
 def login_page(request: Request):
-    return render(request, "login.html", {"settings": settings, "message": ""})
+    db: Session = SessionLocal()
+    try:
+        return render(
+            request,
+            "login.html",
+            {
+                "settings": settings,
+                "message": "",
+                "visual": safe_compute_visual_payload(db),
+            },
+        )
+    finally:
+        db.close()
 
 
 @router.post("/login")
@@ -864,7 +1055,7 @@ def user_login_page(request: Request):
             {
                 "settings": settings,
                 "message": "",
-                "visual": compute_visual_payload(db),
+                "visual": safe_compute_visual_payload(db),
             },
         )
     finally:
@@ -1046,7 +1237,7 @@ def dashboard(request: Request):
 
 
 @router.get("/compute-visual/data")
-def compute_visual_data(request: Request):
+def compute_visual_data():
     db: Session = SessionLocal()
     try:
         return JSONResponse(compute_visual_payload(db))
@@ -1108,9 +1299,6 @@ def create_host(
     workspace_root: str = Form("/workspace/tenants"),
     shared_mnt_path: str = Form("/mnt"),
     snapshot_root: str = Form("/mnt/docker_platform_snapshots"),
-    reserve_cpu_cores: float = Form(8.0),
-    reserve_memory_gb: float = Form(64.0),
-    reserve_disk_gb: float = Form(200.0),
     default_user_share: int = Form(10),
     snapshot_keep_count: int = Form(2),
     snapshot_interval_days: int = Form(14),
@@ -1137,9 +1325,6 @@ def create_host(
             workspace_root=workspace_root,
             shared_mnt_path=shared_mnt_path,
             snapshot_root=snapshot_root,
-            reserve_cpu_cores=reserve_cpu_cores,
-            reserve_memory_gb=reserve_memory_gb,
-            reserve_disk_gb=reserve_disk_gb,
             default_user_share=default_user_share,
             snapshot_keep_count=snapshot_keep_count,
             snapshot_interval_days=snapshot_interval_days,
@@ -1172,6 +1357,196 @@ def create_host(
     return RedirectResponse("/hosts", status_code=303)
 
 
+@router.post("/hosts/test/stream")
+def test_host_stream(
+    request: Request,
+    name: str = Form(...),
+    address: str = Form(...),
+    ssh_port: int = Form(22),
+    ssh_user: str = Form("root"),
+    auth_type: str = Form(AuthType.PASSWORD.value),
+    ssh_password: str = Form(""),
+    ssh_key_path: str = Form(""),
+    port_start: int = Form(50000),
+    port_end: int = Form(50050),
+    workspace_root: str = Form("/workspace/tenants"),
+    shared_mnt_path: str = Form("/mnt"),
+    snapshot_root: str = Form("/mnt/docker_platform_snapshots"),
+    default_user_share: int = Form(10),
+    snapshot_keep_count: int = Form(2),
+    snapshot_interval_days: int = Form(14),
+    notes: str = Form(""),
+):
+    admin_response = require_admin_response(request, "/hosts")
+    if admin_response:
+        return admin_response
+
+    def generate():
+        logs: list[str] = []
+        emitted = 0
+
+        def emit_logs(progress: int | None = None):
+            nonlocal emitted
+            while emitted < len(logs):
+                emitted += 1
+                yield stream_event("log", message=logs[emitted - 1], progress=progress)
+
+        try:
+            yield stream_event("log", message=f"开始检测宿主机 {name} ({address}:{ssh_port})", progress=5)
+            host = build_ssh_host_from_form(
+                name=name,
+                address=address,
+                ssh_port=ssh_port,
+                ssh_user=ssh_user,
+                auth_type=auth_type,
+                ssh_password=ssh_password,
+                ssh_key_path=ssh_key_path,
+                port_start=port_start,
+                port_end=port_end,
+                workspace_root=workspace_root,
+                shared_mnt_path=shared_mnt_path,
+                snapshot_root=snapshot_root,
+                default_user_share=default_user_share,
+                snapshot_keep_count=snapshot_keep_count,
+                snapshot_interval_days=snapshot_interval_days,
+                notes=notes,
+            )
+            result = validate_ssh_docker_with_logs(host, logs, timeout=8)
+            yield from emit_logs(progress=92)
+            docker_info = result["docker_info"]
+            total_memory_gb = float(docker_info.get("MemTotal") or 0) / (1024**3)
+            yield stream_event(
+                "done",
+                ok=True,
+                message="SSH 与 Docker 检测通过。",
+                progress=100,
+                docker={
+                    "cpus": docker_info.get("NCPU"),
+                    "memory_gb": round(total_memory_gb, 1),
+                    "containers": docker_info.get("Containers"),
+                    "server_version": docker_info.get("ServerVersion"),
+                },
+                used_ports=result["used_ports"],
+                available_ports=result["available_ports"],
+            )
+        except RunnerError as exc:
+            yield from emit_logs(progress=100)
+            summary, error_log = runner_error_payload(exc, "SSH 或 Docker 检测失败。")
+            yield stream_event("error", ok=False, message=summary, error_log=error_log, progress=100)
+        except Exception as exc:
+            yield from emit_logs(progress=100)
+            reason = str(exc).strip() or "宿主机检测失败。"
+            yield stream_event("error", ok=False, message=reason, error_log=reason, progress=100)
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@router.post("/hosts/create/stream")
+def create_host_stream(
+    request: Request,
+    name: str = Form(...),
+    address: str = Form(...),
+    ssh_port: int = Form(22),
+    ssh_user: str = Form("root"),
+    auth_type: str = Form(AuthType.PASSWORD.value),
+    ssh_password: str = Form(""),
+    ssh_key_path: str = Form(""),
+    port_start: int = Form(50000),
+    port_end: int = Form(50050),
+    workspace_root: str = Form("/workspace/tenants"),
+    shared_mnt_path: str = Form("/mnt"),
+    snapshot_root: str = Form("/mnt/docker_platform_snapshots"),
+    default_user_share: int = Form(10),
+    snapshot_keep_count: int = Form(2),
+    snapshot_interval_days: int = Form(14),
+    notes: str = Form(""),
+):
+    admin_response = require_admin_response(request, "/hosts")
+    if admin_response:
+        return admin_response
+
+    def generate():
+        logs: list[str] = []
+        emitted = 0
+        db: Session | None = None
+
+        def emit_logs(progress: int | None = None):
+            nonlocal emitted
+            while emitted < len(logs):
+                emitted += 1
+                yield stream_event("log", message=logs[emitted - 1], progress=progress)
+
+        try:
+            yield stream_event("log", message=f"开始保存宿主机 {name} ({address}:{ssh_port})", progress=3)
+            host = build_ssh_host_from_form(
+                name=name,
+                address=address,
+                ssh_port=ssh_port,
+                ssh_user=ssh_user,
+                auth_type=auth_type,
+                ssh_password=ssh_password,
+                ssh_key_path=ssh_key_path,
+                port_start=port_start,
+                port_end=port_end,
+                workspace_root=workspace_root,
+                shared_mnt_path=shared_mnt_path,
+                snapshot_root=snapshot_root,
+                default_user_share=default_user_share,
+                snapshot_keep_count=snapshot_keep_count,
+                snapshot_interval_days=snapshot_interval_days,
+                notes=notes,
+            )
+            yield stream_event("log", message="保存前先执行 SSH 与 Docker 检测。", progress=8)
+            validate_ssh_docker_with_logs(host, logs, timeout=8)
+            yield from emit_logs(progress=78)
+
+            db = SessionLocal()
+            yield stream_event("log", message="检测通过，开始写入平台数据库。", progress=86)
+            db.add(host)
+            db.commit()
+            yield stream_event("log", message="数据库写入完成，宿主机已纳入平台。", progress=96)
+            yield stream_event(
+                "done",
+                ok=True,
+                message=f"宿主机 {name} 已接入平台。",
+                progress=100,
+                redirect_url="/hosts",
+            )
+        except RunnerError as exc:
+            if db is not None:
+                db.rollback()
+            yield from emit_logs(progress=100)
+            summary, error_log = runner_error_payload(exc, "SSH 或 Docker 检测失败。")
+            yield stream_event(
+                "error",
+                ok=False,
+                message=summary,
+                error_log=error_log,
+                progress=100,
+            )
+        except SQLAlchemyError as exc:
+            if db is not None:
+                db.rollback()
+            reason = str(exc).strip()
+            yield stream_event(
+                "error",
+                ok=False,
+                message=reason,
+                error_log=f"{reason}\n数据库事务已回滚，未保留半写入宿主机记录。",
+                progress=100,
+            )
+        except Exception as exc:
+            if db is not None:
+                db.rollback()
+            reason = str(exc).strip() or "宿主机保存失败。"
+            yield stream_event("error", ok=False, message=reason, error_log=reason, progress=100)
+        finally:
+            if db is not None:
+                db.close()
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
 @router.post("/setup/test")
 def test_initial_host(
     request: Request,
@@ -1187,9 +1562,6 @@ def test_initial_host(
     workspace_root: str = Form("/workspace/tenants"),
     shared_mnt_path: str = Form("/mnt"),
     snapshot_root: str = Form("/mnt/docker_platform_snapshots"),
-    reserve_cpu_cores: float = Form(8.0),
-    reserve_memory_gb: float = Form(64.0),
-    reserve_disk_gb: float = Form(200.0),
     default_user_share: int = Form(10),
     snapshot_keep_count: int = Form(2),
     snapshot_interval_days: int = Form(14),
@@ -1212,9 +1584,6 @@ def test_initial_host(
             workspace_root=workspace_root,
             shared_mnt_path=shared_mnt_path,
             snapshot_root=snapshot_root,
-            reserve_cpu_cores=reserve_cpu_cores,
-            reserve_memory_gb=reserve_memory_gb,
-            reserve_disk_gb=reserve_disk_gb,
             default_user_share=default_user_share,
             snapshot_keep_count=snapshot_keep_count,
             snapshot_interval_days=snapshot_interval_days,
@@ -1257,9 +1626,6 @@ def create_initial_host(
     workspace_root: str = Form("/workspace/tenants"),
     shared_mnt_path: str = Form("/mnt"),
     snapshot_root: str = Form("/mnt/docker_platform_snapshots"),
-    reserve_cpu_cores: float = Form(8.0),
-    reserve_memory_gb: float = Form(64.0),
-    reserve_disk_gb: float = Form(200.0),
     default_user_share: int = Form(10),
     snapshot_keep_count: int = Form(2),
     snapshot_interval_days: int = Form(14),
@@ -1290,9 +1656,6 @@ def create_initial_host(
             workspace_root=workspace_root,
             shared_mnt_path=shared_mnt_path,
             snapshot_root=snapshot_root,
-            reserve_cpu_cores=reserve_cpu_cores,
-            reserve_memory_gb=reserve_memory_gb,
-            reserve_disk_gb=reserve_disk_gb,
             default_user_share=default_user_share,
             snapshot_keep_count=snapshot_keep_count,
             snapshot_interval_days=snapshot_interval_days,
@@ -1332,33 +1695,21 @@ def update_host_snapshot_policy(
     admin_response = require_admin_response(request, f"/hosts/{host_id}")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(f"/hosts/{host_id}", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts/{host_id}?error={message}", status_code=303)
+    redirect_url = f"/hosts/{host_id}"
 
     db: Session = SessionLocal()
     try:
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        if not host:
+            return operation_error(request, "未找到宿主机记录。", "/hosts", status_code=404)
         host.snapshot_keep_count = max(snapshot_keep_count, 0)
         host.snapshot_interval_days = max(snapshot_interval_days, 1)
         db.commit()
-        return respond_success("宿主机快照策略已更新。")
+        return operation_success(request, "宿主机快照策略已更新。", redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).replace("\n", " ").strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     finally:
         db.close()
 
@@ -1368,27 +1719,13 @@ def delete_host(request: Request, host_id: int):
     admin_response = require_admin_response(request, "/")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse("/hosts", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts?error={message}", status_code=303)
+    redirect_url = "/hosts"
 
     db: Session = SessionLocal()
     try:
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
         if not host:
-            return respond_error("未找到宿主机记录。", status_code=404)
+            return operation_error(request, "未找到宿主机记录。", redirect_url, status_code=404)
         active_allocations = (
             db.query(Allocation)
             .filter(
@@ -1398,13 +1735,13 @@ def delete_host(request: Request, host_id: int):
             .count()
         )
         if active_allocations > 0:
-            return respond_error("该宿主机仍存在未删除的容器分配记录，暂不能移除。")
+            return operation_error(request, "该宿主机仍存在未删除的容器分配记录，暂不能移除。", redirect_url)
         db.delete(host)
         db.commit()
-        return respond_success(f"宿主机 {host.name} 已从平台记录中移除。")
+        return operation_success(request, f"宿主机 {host.name} 已从平台记录中移除。", redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
-        return respond_error(str(exc).strip())
+        return operation_error(request, str(exc).strip(), redirect_url)
     finally:
         db.close()
 
@@ -1459,6 +1796,9 @@ def host_detail(request: Request, host_id: int):
         allocation_rows = rows_data["allocation_rows"]
         unified_container_rows = rows_data["unified_container_rows"]
         resource_chart_rows = rows_data["resource_chart_rows"]
+        docker_info = cached["docker_info"]
+        root_disk_usage = resolve_root_disk_usage(host, docker_info)
+        workspace_disk_usage = resolve_workspace_disk_usage(docker_info)
         owned_allocation_ids: set[int] = (
             user_allocation_ids(db, platform_user["account"]) if platform_user else set()
         )
@@ -1476,13 +1816,20 @@ def host_detail(request: Request, host_id: int):
         )
         summary = {
             "reachable": cached["reachable"],
-            "docker_info": cached["docker_info"],
+            "docker_info": docker_info,
             "stats": cached["stats"],
             "gpus": cached["gpus"],
             "allocated_cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in allocation_rows),
             "allocated_memory_gb": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in allocation_rows),
+            "allocated_disk_gb": sum(float(row["allocation"].workspace_limit_gb or 0.0) for row in allocation_rows),
             "active_allocations": sum(1 for row in allocation_rows if row["status"] == AllocationStatus.RUNNING.value),
             "container_count": len(cached["container_rows"]),
+            "total_cpu_cores": float(docker_info.get("NCPU") or 0),
+            "total_memory_gb": float(docker_info.get("MemTotal") or 0) / (1024**3),
+            "root_disk_total_gb": float(root_disk_usage.get("total_gb") or 0),
+            "root_disk_used_gb": float(root_disk_usage.get("used_gb") or 0),
+            "workspace_disk_total_gb": float(workspace_disk_usage.get("total_gb") or root_disk_usage.get("total_gb") or 0),
+            "workspace_disk_used_gb": float(workspace_disk_usage.get("used_gb") or root_disk_usage.get("used_gb") or 0),
         }
         defaults = recommended_defaults(host, cached["docker_info"])
         port_state = host_port_pool_state(host, db_allocations, cached["container_rows"])
@@ -1532,6 +1879,7 @@ def host_terminal(request: Request, host_id: int):
     admin_response = require_admin_response(request, f"/hosts/{host_id}")
     if admin_response:
         return admin_response
+    admin = getattr(request.state, "admin", None) or {}
     db: Session = SessionLocal()
     try:
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
@@ -1549,6 +1897,7 @@ def host_terminal(request: Request, host_id: int):
                 "reachable": cached["reachable"],
                 "last_status_at": format_cache_time(cached["refreshed_at"]),
                 "last_status_error": cached["error_log"] or "",
+                "terminal_token": sign_terminal_token(admin.get("account", ""), "host", host.id),
             },
         )
     finally:
@@ -1617,28 +1966,16 @@ async def host_terminal_ws(websocket: WebSocket, host_id: int):
     fallback_mode = False
     try:
         await websocket.accept()
-        cookie_header = websocket.headers.get("cookie") or ""
-        cookies = {}
-        for chunk in cookie_header.split(";"):
-            if "=" in chunk:
-                key, value = chunk.split("=", 1)
-                cookies[key.strip()] = value.strip()
-        ip_address = websocket_client_ip(websocket)
-        account = read_session(cookies.get(SESSION_COOKIE), ip_address)
-        admin = None
-        if account:
-            if account == settings.root_admin_account:
-                admin = {"account": account, "is_root": True}
-            else:
-                admin_user = db.query(AdminUser).filter(AdminUser.account == account).first()
-                if admin_user and admin_user.status == AdminStatus.APPROVED.value:
-                    admin = {"account": account, "is_root": False}
+        cookies = websocket_cookies(websocket)
+        admin = websocket_admin(cookies, websocket, db)
+        if not admin:
+            admin = admin_from_account(db, terminal_token_account(websocket, "host", host_id))
         if not admin:
             await websocket.send_json(
                 {
                     "event": "error",
                     "message": "当前账号无管理权限。",
-                    "error_log": "普通使用者禁止访问宿主机 SSH shell。",
+                    "error_log": "未识别到有效管理员登录态。请从宿主机详情页重新点击 SSH 命令行；若仍失败，请确认当前浏览器使用的是管理员账号。",
                 }
             )
             await websocket.close()
@@ -1760,6 +2097,13 @@ def allocation_terminal(request: Request, allocation_id: int):
         owner_response = allocation_owner_response(request, allocation)
         if owner_response:
             return owner_response
+        terminal_account = ""
+        admin = getattr(request.state, "admin", None)
+        platform_user = getattr(request.state, "platform_user", None)
+        if admin:
+            terminal_account = admin.get("account", "")
+        elif platform_user:
+            terminal_account = platform_user.get("account", "")
         return render(
             request,
             "container_terminal.html",
@@ -1767,6 +2111,7 @@ def allocation_terminal(request: Request, allocation_id: int):
                 "settings": settings,
                 "allocation": allocation,
                 "host": allocation.host,
+                "terminal_token": sign_terminal_token(terminal_account, "allocation", allocation.id),
             },
         )
     except ValueError:
@@ -1785,15 +2130,14 @@ async def allocation_terminal_ws(websocket: WebSocket, allocation_id: int):
     allocation = None
     try:
         await websocket.accept()
-        cookie_header = websocket.headers.get("cookie") or ""
-        cookies = {}
-        for chunk in cookie_header.split(";"):
-            if "=" in chunk:
-                key, value = chunk.split("=", 1)
-                cookies[key.strip()] = value.strip()
-        ip_address = websocket_client_ip(websocket)
-        admin_account = read_session(cookies.get(SESSION_COOKIE), ip_address)
-        user_account = read_session(cookies.get(USER_SESSION_COOKIE), ip_address)
+        cookies = websocket_cookies(websocket)
+        admin = websocket_admin(cookies, websocket, db)
+        user_account = read_websocket_session(cookies, USER_SESSION_COOKIE, websocket)
+        token_account = terminal_token_account(websocket, "allocation", allocation_id)
+        if not admin:
+            admin = admin_from_account(db, token_account)
+        if not user_account and token_account and not admin:
+            user_account = token_account
 
         allocation = db.query(Allocation).filter(Allocation.id == allocation_id).first()
         if not allocation or allocation.status == AllocationStatus.DELETED.value:
@@ -1801,20 +2145,18 @@ async def allocation_terminal_ws(websocket: WebSocket, allocation_id: int):
             await websocket.close()
             return
 
-        admin_allowed = False
-        if admin_account:
-            if admin_account == settings.root_admin_account:
-                admin_allowed = True
-            else:
-                admin_user = db.query(AdminUser).filter(AdminUser.account == admin_account).first()
-                admin_allowed = bool(admin_user and admin_user.status == AdminStatus.APPROVED.value)
+        admin_allowed = bool(admin)
         user_allowed = bool(user_account and allocation.assignee == user_account)
         if not admin_allowed and not user_allowed:
             await websocket.send_json(
                 {
                     "event": "error",
                     "message": "当前账号不能访问该容器终端。",
-                    "error_log": "容器终端只允许管理员或该容器使用者访问。",
+                    "error_log": (
+                        "容器终端只允许管理员或该容器使用者访问。"
+                        f" 当前识别账号：{user_account or (admin or {}).get('account') or '未识别'}；"
+                        f" 容器使用者：{allocation.assignee}。请从宿主机详情页重新点击对应容器命令行。"
+                    ),
                 }
             )
             await websocket.close()
@@ -1957,7 +2299,7 @@ async def allocation_terminal_ws(websocket: WebSocket, allocation_id: int):
 
 
 @router.get("/hosts/{host_id}/metrics")
-def host_metrics(request: Request, host_id: int):
+def host_metrics(host_id: int):
     db: Session = SessionLocal()
     try:
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
@@ -1981,6 +2323,16 @@ def host_metrics(request: Request, host_id: int):
             .all()
         )
         rows_data = build_host_rows_from_cached_data(host, db_allocations, cached)
+        active_allocation_rows = [
+            row for row in rows_data["allocation_rows"]
+            if row["allocation"].status in ACTIVE_STATUSES
+        ]
+        allocated_payload = {
+            "cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in active_allocation_rows),
+            "memory": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in active_allocation_rows),
+            "disk": sum(float(row["allocation"].workspace_limit_gb or 0.0) for row in active_allocation_rows),
+            "gpu": sum(float(row.get("gpu_memory_used_mb") or 0.0) for row in rows_data["resource_chart_rows"]) / 1024,
+        }
         if cache_needs_full_refresh(host, cached, db) and not cached["container_rows"]:
             return JSONResponse(
                 {
@@ -1991,6 +2343,7 @@ def host_metrics(request: Request, host_id: int):
                     "updated_at": "正在更新",
                     "last_status_at": "正在更新",
                     "rows": rows_data["resource_chart_rows"],
+                    "allocated": allocated_payload,
                     "gpus": cached["gpus"],
                     "refresh_in_progress": cached["refresh_in_progress"],
                 },
@@ -2007,6 +2360,7 @@ def host_metrics(request: Request, host_id: int):
                     "refresh_in_progress": True,
                     "refresh_started_at": format_cache_time(cached["refresh_started_at"]),
                     "rows": rows_data["resource_chart_rows"],
+                    "allocated": allocated_payload,
                     "gpus": cached["gpus"],
                 }
             )
@@ -2020,6 +2374,7 @@ def host_metrics(request: Request, host_id: int):
                     "updated_at": format_cache_time(cached["refreshed_at"]),
                     "last_status_at": format_cache_time(cached["refreshed_at"]),
                     "rows": rows_data["resource_chart_rows"],
+                    "allocated": allocated_payload,
                     "gpus": cached["gpus"],
                     "refresh_in_progress": cached["refresh_in_progress"],
                 },
@@ -2032,6 +2387,7 @@ def host_metrics(request: Request, host_id: int):
                 "updated_at": format_cache_time(cached["refreshed_at"]),
                 "last_status_at": format_cache_time(cached["refreshed_at"]),
                 "rows": rows_data["resource_chart_rows"],
+                "allocated": allocated_payload,
                 "gpus": cached["gpus"],
                 "refresh_in_progress": cached["refresh_in_progress"],
             }
@@ -2072,21 +2428,8 @@ def create_allocation(
     admin_response = require_admin_response(request, "/")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(f"/hosts/{host_id}", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts/{host_id}?error={message}", status_code=303)
+    is_ajax = wants_json(request)
+    redirect_url = f"/hosts/{host_id}"
 
     db: Session = SessionLocal()
     host = None
@@ -2095,9 +2438,9 @@ def create_allocation(
     try:
         host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
         if not host:
-            return respond_error("未找到宿主机记录。", status_code=404)
+            return operation_error(request, "未找到宿主机记录。", "/hosts", status_code=404)
         if host_port < host.port_start or host_port > host.port_end:
-            return respond_error(f"端口 {host_port} 不在当前宿主机端口池 {host.port_start}-{host.port_end} 内。")
+            return operation_error(request, f"端口 {host_port} 不在当前宿主机端口池 {host.port_start}-{host.port_end} 内。", redirect_url)
         docker = DockerService(host)
         container_name = f"{slugify(host.name)}-{host_port}"
         logs.append(f"准备创建容器 {container_name}")
@@ -2111,7 +2454,7 @@ def create_allocation(
             .first()
         )
         if active_port_allocation:
-            return respond_error(f"端口 {host_port} 已存在平台分配记录，请选择其他端口。")
+            return operation_error(request, f"端口 {host_port} 已存在平台分配记录，请选择其他端口。", redirect_url)
         allocation = (
             db.query(Allocation)
             .filter(
@@ -2121,7 +2464,7 @@ def create_allocation(
             .first()
         )
         if allocation and allocation.status != AllocationStatus.DELETED.value:
-            return respond_error(f"端口 {host_port} 已存在历史分配记录且未删除完成，请先检查该容器状态。")
+            return operation_error(request, f"端口 {host_port} 已存在历史分配记录且未删除完成，请先检查该容器状态。", redirect_url)
 
         logs.append("检查 Docker 端口占用")
         reachable = docker.ping()
@@ -2134,20 +2477,22 @@ def create_allocation(
                 pass
             used_ports = docker.used_host_ports() if reachable else set()
             if host_port in used_ports:
-                return respond_error(f"端口 {host_port} 已被 Docker 实际占用，请选择其他端口。")
+                return operation_error(request, f"端口 {host_port} 已被 Docker 实际占用，请选择其他端口。", redirect_url)
         logs.append("检查准入配额")
         decision = check_allocation(db, host, cpu_limit_cores, memory_limit_gb, workspace_limit_gb)
         logs.extend(decision.warnings or [])
         if not decision.allowed:
             reason = "；".join(decision.reasons)
-            return respond_error(reason)
+            return operation_error(request, reason, redirect_url)
 
         selected_image = (base_image_override or "").strip()
         if not selected_image:
-            return respond_error("请选择或填写该宿主机本地已有基础镜像。", status_code=400)
+            return operation_error(request, "请选择或填写该宿主机本地已有基础镜像。", redirect_url, status_code=400)
         if not is_supported_base_image(selected_image):
-            return respond_error(
+            return operation_error(
+                request,
                 "基础镜像格式不符合平台要求，请选择 pytorch:x.x.x-cudax.x-cudnn... 形式的镜像。",
+                redirect_url,
                 status_code=400,
             )
 
@@ -2190,7 +2535,7 @@ def create_allocation(
         db.commit()
         if is_ajax:
             return log_response(logs + ["容器创建成功"], ok=True, message=f"容器创建成功，端口 {host_port} 已分配给 {assignee}。")
-        return respond_success(f"容器创建成功，端口 {host_port} 已分配给 {assignee}。")
+        return operation_success(request, f"容器创建成功，端口 {host_port} 已分配给 {assignee}。", redirect_url)
     except RunnerError as exc:
         if host and container_name:
             try:
@@ -2202,15 +2547,15 @@ def create_allocation(
         summary, error_log = runner_error_payload(exc, "容器创建失败。")
         if is_ajax:
             return log_response(logs + ["容器创建失败，已回滚数据库事务"], ok=False, message=summary, error_log=error_log, status_code=200)
-        return respond_error(error_log)
+        return operation_error(request, error_log, redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     except Exception as exc:
         db.rollback()
         reason = str(exc).strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     finally:
         db.close()
 
@@ -2226,26 +2571,14 @@ def update_allocation_resources(
     admin_response = require_admin_response(request, "/")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(f"/hosts/{allocation.host_id}", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts/{allocation.host_id}?error={message}", status_code=303)
+    is_ajax = wants_json(request)
+    redirect_url = "/"
 
     db: Session = SessionLocal()
     logs: list[str] = []
     try:
         allocation = _require_allocation(db, allocation_id)
+        redirect_url = f"/hosts/{allocation.host_id}"
         original_state = {
             "cpu_limit_cores": allocation.cpu_limit_cores,
             "memory_limit_gb": allocation.memory_limit_gb,
@@ -2262,13 +2595,8 @@ def update_allocation_resources(
         logs.extend(decision.warnings or [])
         if not decision.allowed:
             reason = "；".join(decision.reasons)
-            return respond_error(reason)
+            return operation_error(request, reason, redirect_url)
 
-        original_state = {
-            "cpu_limit_cores": allocation.cpu_limit_cores,
-            "memory_limit_gb": allocation.memory_limit_gb,
-            "workspace_limit_gb": allocation.workspace_limit_gb,
-        }
         allocation.cpu_limit_cores = cpu_limit_cores
         allocation.memory_limit_gb = memory_limit_gb
         allocation.workspace_limit_gb = workspace_limit_gb
@@ -2278,7 +2606,7 @@ def update_allocation_resources(
             db.commit()
             if is_ajax:
                 return log_response(logs + ["资源更新成功"], ok=True, message=f"端口 {allocation.host_port} 资源上限已更新。")
-            return respond_success(f"端口 {allocation.host_port} 资源上限已更新。")
+            return operation_success(request, f"端口 {allocation.host_port} 资源上限已更新。", redirect_url)
         except Exception:
             allocation.cpu_limit_cores = original_state["cpu_limit_cores"]
             allocation.memory_limit_gb = original_state["memory_limit_gb"]
@@ -2290,14 +2618,14 @@ def update_allocation_resources(
         summary, error_log = runner_error_payload(exc, "资源更新失败。")
         if is_ajax:
             return JSONResponse({"ok": False, "message": summary, "error_log": error_log}, status_code=200)
-        return respond_error(error_log)
+        return operation_error(request, error_log, redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     except ValueError as exc:
         db.rollback()
-        return respond_error(str(exc), status_code=404)
+        return operation_error(request, str(exc), redirect_url, status_code=404)
     finally:
         db.close()
 
@@ -2311,26 +2639,14 @@ def update_allocation_mounts(
     admin_response = require_admin_response(request, "/")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(f"/hosts/{allocation.host_id}", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts/{allocation.host_id}?error={message}", status_code=303)
+    is_ajax = wants_json(request)
+    redirect_url = "/"
 
     db: Session = SessionLocal()
     logs: list[str] = []
     try:
         allocation = _require_allocation(db, allocation_id)
+        redirect_url = f"/hosts/{allocation.host_id}"
         original_state = {
             "extra_mounts": allocation.extra_mounts,
             "pending_rebuild": allocation.pending_rebuild,
@@ -2344,7 +2660,7 @@ def update_allocation_mounts(
             db.commit()
             if is_ajax:
                 return log_response(logs + ["挂载变更记录成功"], ok=True, message=f"端口 {allocation.host_port} 挂载变更已记录，待下次启动时自动重建生效。")
-            return respond_success(f"端口 {allocation.host_port} 挂载变更已记录，待下次启动时自动重建生效。")
+            return operation_success(request, f"端口 {allocation.host_port} 挂载变更已记录，待下次启动时自动重建生效。", redirect_url)
         except Exception:
             allocation.extra_mounts = original_state["extra_mounts"]
             allocation.pending_rebuild = original_state["pending_rebuild"]
@@ -2354,10 +2670,10 @@ def update_allocation_mounts(
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     except ValueError as exc:
         db.rollback()
-        return respond_error(str(exc), status_code=404)
+        return operation_error(request, str(exc), redirect_url, status_code=404)
     finally:
         db.close()
 
@@ -2371,26 +2687,14 @@ def allocation_action(
     admin_response = require_admin_response(request, "/")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(f"/hosts/{allocation.host_id}", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts/{allocation.host_id}?error={message}", status_code=303)
+    is_ajax = wants_json(request)
+    redirect_url = "/"
 
     db: Session = SessionLocal()
     logs: list[str] = []
     try:
         allocation = _require_allocation(db, allocation_id)
+        redirect_url = f"/hosts/{allocation.host_id}"
         docker = DockerService(allocation.host)
         original_status = allocation.status
         success_message = "操作执行完成。"
@@ -2444,27 +2748,27 @@ def allocation_action(
             schedule_host_refresh(allocation.host_id, full=False)
             success_message = f"端口 {allocation.host_port} 对应容器已删除。"
         else:
-            return respond_error("不支持的操作类型。", status_code=400)
+            return operation_error(request, "不支持的操作类型。", redirect_url, status_code=400)
         try:
             db.commit()
             if is_ajax:
                 return log_response(logs + ["维护操作成功"], ok=True, message=success_message)
-            return respond_success(success_message)
+            return operation_success(request, success_message, redirect_url)
         except Exception:
             allocation.status = original_status
             db.rollback()
             raise
     except RunnerError as exc:
         db.rollback()
-        db = SessionLocal()
+        reconcile_db: Session = SessionLocal()
         try:
-            allocation = _require_allocation(db, allocation_id)
+            allocation = _require_allocation(reconcile_db, allocation_id)
             DockerService(allocation.host).reconcile_allocation_state(allocation)
-            db.commit()
+            reconcile_db.commit()
         except Exception:
-            db.rollback()
+            reconcile_db.rollback()
         finally:
-            db.close()
+            reconcile_db.close()
         action_message = {
             "stop": "停止操作失败。",
             "start": "启动操作失败。",
@@ -2473,14 +2777,14 @@ def allocation_action(
         summary, error_log = runner_error_payload(exc, action_message)
         if is_ajax:
             return JSONResponse({"ok": False, "message": summary, "error_log": error_log}, status_code=200)
-        return respond_error(error_log)
+        return operation_error(request, error_log, redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     except ValueError as exc:
         db.rollback()
-        return respond_error(str(exc), status_code=404)
+        return operation_error(request, str(exc), redirect_url, status_code=404)
     finally:
         db.close()
 
@@ -2680,26 +2984,14 @@ def create_snapshot(
     admin_response = require_admin_response(request, "/")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(f"/hosts/{allocation.host_id}", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts/{allocation.host_id}?error={message}", status_code=303)
+    is_ajax = wants_json(request)
+    redirect_url = "/"
 
     db: Session = SessionLocal()
     logs: list[str] = []
     try:
         allocation = _require_allocation(db, allocation_id)
+        redirect_url = f"/hosts/{allocation.host_id}"
         original_state = {
             "snapshot_policy_override": allocation.snapshot_policy_override,
             "snapshot_keep_count": allocation.snapshot_keep_count,
@@ -2719,8 +3011,10 @@ def create_snapshot(
                         f"环境快照创建完成。该端口已改为独立快照策略：保留 {allocation.snapshot_keep_count} 份，周期 {allocation.snapshot_interval_days} 天。"
                     )
                 )
-            return respond_success(
-                f"环境快照创建完成。该端口已改为独立快照策略：保留 {allocation.snapshot_keep_count} 份，周期 {allocation.snapshot_interval_days} 天。"
+            return operation_success(
+                request,
+                f"环境快照创建完成。该端口已改为独立快照策略：保留 {allocation.snapshot_keep_count} 份，周期 {allocation.snapshot_interval_days} 天。",
+                redirect_url,
             )
         except Exception:
             allocation.snapshot_policy_override = original_state["snapshot_policy_override"]
@@ -2733,14 +3027,14 @@ def create_snapshot(
         summary, error_log = runner_error_payload(exc, "环境快照创建失败。")
         if is_ajax:
             return JSONResponse({"ok": False, "message": summary, "error_log": error_log}, status_code=200)
-        return respond_error(error_log)
+        return operation_error(request, error_log, redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     except ValueError as exc:
         db.rollback()
-        return respond_error(str(exc), status_code=404)
+        return operation_error(request, str(exc), redirect_url, status_code=404)
     finally:
         db.close()
 
@@ -2830,26 +3124,14 @@ def restore_snapshot(request: Request, allocation_id: int, snapshot_id: int):
     admin_response = require_admin_response(request, "/")
     if admin_response:
         return admin_response
-    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-
-    def respond_success(message: str):
-        if is_ajax:
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(f"/hosts/{allocation.host_id}", status_code=303)
-
-    def respond_error(message: str, status_code: int = 200):
-        if is_ajax:
-            summary, error_log = split_error_payload(message)
-            return JSONResponse(
-                {"ok": False, "message": summary, "error_log": error_log},
-                status_code=status_code,
-            )
-        return RedirectResponse(f"/hosts/{allocation.host_id}?error={message}", status_code=303)
+    is_ajax = wants_json(request)
+    redirect_url = "/"
 
     db: Session = SessionLocal()
     logs: list[str] = []
     try:
         allocation = _require_allocation(db, allocation_id)
+        redirect_url = f"/hosts/{allocation.host_id}"
         snapshot = _require_snapshot(db, snapshot_id)
         original_status = allocation.status
         logs.append(f"恢复端口 {allocation.host_port} 到快照 {snapshot.snapshot_name}")
@@ -2864,7 +3146,7 @@ def restore_snapshot(request: Request, allocation_id: int, snapshot_id: int):
             db.commit()
             if is_ajax:
                 return log_response(logs + ["快照恢复成功"], ok=True, message=f"端口 {allocation.host_port} 已恢复到快照 {snapshot.snapshot_name}。")
-            return respond_success(f"端口 {allocation.host_port} 已恢复到快照 {snapshot.snapshot_name}。")
+            return operation_success(request, f"端口 {allocation.host_port} 已恢复到快照 {snapshot.snapshot_name}。", redirect_url)
         except Exception:
             allocation.status = original_status
             db.rollback()
@@ -2874,13 +3156,13 @@ def restore_snapshot(request: Request, allocation_id: int, snapshot_id: int):
         summary, error_log = runner_error_payload(exc, "快照恢复失败。")
         if is_ajax:
             return JSONResponse({"ok": False, "message": summary, "error_log": error_log}, status_code=200)
-        return respond_error(error_log)
+        return operation_error(request, error_log, redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
-        return respond_error(reason)
+        return operation_error(request, reason, redirect_url)
     except ValueError as exc:
         db.rollback()
-        return respond_error(str(exc), status_code=404)
+        return operation_error(request, str(exc), redirect_url, status_code=404)
     finally:
         db.close()

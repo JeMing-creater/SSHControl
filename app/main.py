@@ -6,7 +6,7 @@ import contextlib
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -22,7 +22,7 @@ from app.services.snapshots import create_snapshot_record, snapshot_due
 settings = get_settings()
 
 
-async def host_monitor_scheduler(app: FastAPI) -> None:
+async def host_monitor_scheduler() -> None:
     while True:
         db = SessionLocal()
         try:
@@ -37,7 +37,7 @@ async def host_monitor_scheduler(app: FastAPI) -> None:
         await asyncio.sleep(settings.host_monitor_interval_seconds)
 
 
-async def snapshot_scheduler(app: FastAPI) -> None:
+async def snapshot_scheduler() -> None:
     while True:
         db = SessionLocal()
         try:
@@ -59,8 +59,8 @@ async def snapshot_scheduler(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     init_db()
     app.state.templates = Jinja2Templates(directory=str(settings.templates_dir))
-    scheduler_task = asyncio.create_task(snapshot_scheduler(app))
-    monitor_task = asyncio.create_task(host_monitor_scheduler(app))
+    scheduler_task = asyncio.create_task(snapshot_scheduler())
+    monitor_task = asyncio.create_task(host_monitor_scheduler())
     app.state.scheduler_task = scheduler_task
     app.state.monitor_task = monitor_task
     try:
@@ -115,7 +115,25 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             {"ok": False, "message": message, "details": exc.errors()},
             status_code=422,
         )
-    return JSONResponse({"detail": exc.errors(), "message": message}, status_code=422)
+    templates = getattr(request.app.state, "templates", None)
+    if templates:
+        return templates.TemplateResponse(
+            request,
+            "error.html",
+            {
+                "settings": settings,
+                "admin": getattr(request.state, "admin", None),
+                "platform_user": getattr(request.state, "platform_user", None),
+                "is_user_view": bool(getattr(request.state, "platform_user", None)),
+                "message": message,
+                "error_log": str(exc.errors()),
+            },
+            status_code=422,
+        )
+    return HTMLResponse(
+        f"<h1>{message}</h1><pre>{exc.errors()}</pre>",
+        status_code=422,
+    )
 
 
 @app.exception_handler(Exception)
@@ -127,7 +145,22 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             {"ok": False, "message": message, "error_log": error_log},
             status_code=500,
         )
-    return JSONResponse(
-        {"ok": False, "message": message, "error_log": error_log},
+    templates = getattr(request.app.state, "templates", None)
+    if templates:
+        return templates.TemplateResponse(
+            request,
+            "error.html",
+            {
+                "settings": settings,
+                "admin": getattr(request.state, "admin", None),
+                "platform_user": getattr(request.state, "platform_user", None),
+                "is_user_view": bool(getattr(request.state, "platform_user", None)),
+                "message": message,
+                "error_log": error_log,
+            },
+            status_code=500,
+        )
+    return HTMLResponse(
+        f"<h1>{message}</h1><pre>{error_log}</pre>",
         status_code=500,
     )

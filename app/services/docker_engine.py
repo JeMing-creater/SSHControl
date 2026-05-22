@@ -138,6 +138,63 @@ class DockerService:
             )
         return result.stdout
 
+    def _error_text(self, exc: BaseException) -> str:
+        if isinstance(exc, RunnerError):
+            return exc.log_text()
+        return str(exc)
+
+    def _is_nvidia_runtime_error(self, exc: BaseException) -> bool:
+        text = self._error_text(exc).lower()
+        markers = (
+            "nvidia-persistenced",
+            "/run/nvidia-persistenced/socket",
+            "nvidia-container",
+            "nvidia runtime",
+            "nvml",
+            "driver/library version mismatch",
+        )
+        return any(marker in text for marker in markers)
+
+    def recover_nvidia_runtime(self, logs: list[str] | None = None) -> bool:
+        self._log(logs, "检测到 NVIDIA runtime 异常，尝试无破坏修复 nvidia-persistenced。")
+        script = """
+set -u
+if [ -S /run/nvidia-persistenced/socket ]; then
+    echo "nvidia-persistenced socket 已存在。"
+    exit 0
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl start nvidia-persistenced 2>&1 || true
+fi
+
+if [ ! -S /run/nvidia-persistenced/socket ] && command -v nvidia-persistenced >/dev/null 2>&1; then
+    mkdir -p /run/nvidia-persistenced
+    nvidia-persistenced --user root >/tmp/control-nvidia-persistenced.log 2>&1 || true
+fi
+
+sleep 1
+if [ -S /run/nvidia-persistenced/socket ]; then
+    echo "nvidia-persistenced socket 已恢复。"
+    exit 0
+fi
+
+echo "nvidia-persistenced socket 仍不存在。" >&2
+systemctl status nvidia-persistenced --no-pager -l 2>&1 | tail -40 >&2 || true
+tail -40 /tmp/control-nvidia-persistenced.log 2>/dev/null >&2 || true
+nvidia-smi 2>&1 | head -40 >&2 || true
+exit 1
+"""
+        result = self.runner.run(f"sh -lc {shlex.quote(script)}", timeout=90)
+        if result.ok:
+            self._log(logs, result.stdout.strip() or "nvidia-persistenced 修复命令已完成。")
+            return True
+        error_log = "\n".join(part for part in [result.stderr, result.stdout] if part).strip()
+        self._log(logs, "NVIDIA runtime 自动修复未成功。")
+        if error_log:
+            self._log(logs, error_log)
+        return False
+
     def ping(self, timeout: int = 120) -> bool:
         try:
             self._run("docker info >/dev/null 2>&1", timeout=timeout)
@@ -204,10 +261,6 @@ class DockerService:
     def docker_info(self, timeout: int = 120) -> dict:
         raw = self._run("docker info --format '{{json .}}'", timeout=timeout)
         return json.loads(raw)
-
-    def list_containers(self) -> list[dict]:
-        raw = self._run("docker ps -a --format '{{json .}}'")
-        return parse_json_lines(raw)
 
     def container_disk_usage_gb_map(self, timeout: int = 120) -> dict[str, dict[str, float | str]]:
         raw = self._run("docker ps -a --size --format '{{json .}}'", timeout=timeout)
@@ -344,8 +397,8 @@ exit 1
             "target": mounted_on,
         }
 
-    def list_images(self) -> list[str]:
-        raw = self._run("docker images --format '{{.Repository}}:{{.Tag}}'")
+    def list_images(self, timeout: int = 120) -> list[str]:
+        raw = self._run("docker images --format '{{.Repository}}:{{.Tag}}'", timeout=timeout)
         images: list[str] = []
         seen: set[str] = set()
         for line in raw.splitlines():
@@ -356,10 +409,10 @@ exit 1
             images.append(image)
         return images
 
-    def images_from_containers(self) -> list[str]:
+    def images_from_containers(self, timeout: int = 240) -> list[str]:
         images: list[str] = []
         seen: set[str] = set()
-        for detail in self.container_details():
+        for detail in self.container_details(timeout=timeout):
             image = (detail.get("Config", {}) or {}).get("Image") or ""
             image = image.strip()
             if not image or image.startswith("<none>:") or image in seen:
@@ -383,25 +436,32 @@ exit 1
                     images.append(image)
         return images
 
-    def images_from_root_dockerfile(self) -> list[str]:
-        result = self.runner.run("cat /root/Dockerfile", timeout=30)
+    def images_from_root_dockerfile(self, timeout: int = 30) -> list[str]:
+        result = self.runner.run("cat /root/Dockerfile", timeout=timeout)
         if not result.ok or not result.stdout.strip():
             return []
         return self._images_from_dockerfile_text(result.stdout)
 
-    def discover_images(self) -> list[str]:
+    def discover_images(self, timeout: int = 120) -> list[str]:
+        command_timeout = max(4, timeout)
         try:
-            images = filter_supported_base_images(self.list_images())
+            images = filter_supported_base_images(self.list_images(timeout=command_timeout))
         except RunnerError:
             images = []
         if images:
             return images
 
-        images = filter_supported_base_images(self.images_from_containers())
+        try:
+            images = filter_supported_base_images(self.images_from_containers(timeout=command_timeout))
+        except RunnerError:
+            images = []
         if images:
             return images
 
-        images = filter_supported_base_images(self.images_from_root_dockerfile())
+        try:
+            images = filter_supported_base_images(self.images_from_root_dockerfile(timeout=min(command_timeout, 8)))
+        except RunnerError:
+            images = []
         if images:
             return images
 
@@ -410,7 +470,7 @@ exit 1
             "\\( -name Dockerfile -o -name dockerfile \\) 2>/dev/null | head -20 | "
             "while read -r file; do echo '###'\"$file\"; cat \"$file\"; done"
         )
-        result = self.runner.run(command, timeout=120)
+        result = self.runner.run(command, timeout=command_timeout)
         if not result.ok or not result.stdout.strip():
             return []
         return filter_supported_base_images(self._images_from_dockerfile_text(result.stdout))
@@ -423,9 +483,9 @@ exit 1
         )
         return parse_json_lines(raw)
 
-    def used_host_ports(self) -> set[int]:
+    def used_host_ports(self, timeout: int = 240) -> set[int]:
         used_ports: set[int] = set()
-        for detail in self.container_details():
+        for detail in self.container_details(timeout=timeout):
             used_ports.update(_container_host_ports(detail))
         return used_ports
 
@@ -508,13 +568,6 @@ exit 1
                 }
             )
         return records
-
-    def gpu_memory_by_container(self, timeout: int = 120) -> dict[str, float]:
-        detail_by_container = self.gpu_memory_detail_by_container(timeout=timeout)
-        return {
-            container_name: sum(float(item.get("used_memory_mb") or 0.0) for item in items)
-            for container_name, items in detail_by_container.items()
-        }
 
     def gpu_memory_detail_by_container(self, timeout: int = 120) -> dict[str, list[dict]]:
         try:
@@ -605,38 +658,6 @@ exit 1
             for container_name, gpu_usage in usage_by_container_gpu.items()
         }
 
-    def workspace_usage_gb_map(self, allocations: list[Allocation]) -> dict[str, float]:
-        if not allocations:
-            return {}
-
-        script_lines: list[str] = []
-        for allocation in allocations:
-            workspace_dir = f"{self.host.workspace_root}/{allocation.container_name}"
-            script_lines.append(
-                "if [ -d {path} ]; then size=$(du -sb {path} | cut -f1); "
-                "else size=0; fi; printf '%s\t%s\n' {name} \"$size\"".format(
-                    path=shlex.quote(workspace_dir),
-                    name=shlex.quote(allocation.container_name),
-                )
-            )
-
-        command = "bash -lc " + shlex.quote("set -e; " + "; ".join(script_lines))
-        result = self.runner.run(command, timeout=600)
-        if not result.ok:
-            return {}
-
-        usage_by_container: dict[str, float] = {}
-        for line in result.stdout.splitlines():
-            parts = line.strip().split("\t", maxsplit=1)
-            if len(parts) != 2:
-                continue
-            name, raw_size = parts
-            try:
-                usage_by_container[name] = float(raw_size) / (1024**3)
-            except ValueError:
-                usage_by_container[name] = 0.0
-        return usage_by_container
-
     def ensure_workspace_dir(self, allocation: Allocation) -> str:
         workspace_dir = f"{self.host.workspace_root}/{allocation.container_name}"
         self._run(f"mkdir -p {shlex.quote(workspace_dir)}")
@@ -645,13 +666,6 @@ exit 1
     def snapshot_dir(self, allocation: Allocation) -> str:
         host_slug = slugify(self.host.name)
         return f"{self.host.snapshot_root}/{host_slug}/{allocation.host_port}"
-
-    def inspect_container_ip(self, allocation: Allocation) -> str | None:
-        raw = self._run(
-            "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
-            f"{shlex.quote(allocation.container_name)}"
-        )
-        return raw.strip() or None
 
     def verify_container_access(self, allocation: Allocation, timeout_seconds: int = 20) -> None:
         deadline = time.time() + timeout_seconds
@@ -687,8 +701,12 @@ exit 1
             )
         )
 
-    def cleanup_failed_container(self, allocation: Allocation) -> None:
+    def cleanup_failed_container(self, allocation: Allocation, logs: list[str] | None = None) -> None:
         self.ensure_container_absent(allocation.container_name)
+        workspace_dir = f"{self.host.workspace_root}/{allocation.container_name}"
+        result = self.runner.run(f"rmdir {shlex.quote(workspace_dir)} 2>/dev/null || true", timeout=30)
+        if result.ok:
+            self._log(logs, "已清理失败创建留下的空工作目录；非空目录会被保留以避免误删数据。")
 
     def prepare_x11_support(self, allocation: Allocation) -> None:
         if not allocation.x11_enabled:
@@ -768,15 +786,51 @@ fi
             shlex.quote(allocation.image_name),
         ]
         command = " ".join(part for part in command_parts if part)
+        last_exc: BaseException | None = None
+        recovered_nvidia = False
         try:
-            self._run_with_retries(command, timeout=600, logs=logs, retries=1)
+            for attempt in range(1, 4):
+                self._log(logs, f"[尝试 {attempt}] {command}")
+                try:
+                    self._run(command, timeout=600)
+                    self._log(logs, f"[成功] {command}")
+                    last_exc = None
+                    break
+                except RunnerError as exc:
+                    last_exc = exc
+                    self._log(logs, f"[失败] {exc}")
+                    try:
+                        self._log(logs, "清理本次失败创建留下的同名容器，避免污染下一次重试。")
+                        self.ensure_container_absent(allocation.container_name)
+                    except RunnerError as cleanup_exc:
+                        self._log(logs, f"残留容器清理失败：{cleanup_exc}")
+                    if attempt >= 3:
+                        break
+                    if allocation.all_gpus_visible and self._is_nvidia_runtime_error(exc):
+                        if recovered_nvidia:
+                            self._log(logs, "NVIDIA runtime 已尝试修复但仍失败，停止继续重试。")
+                            break
+                        recovered_nvidia = True
+                        if not self.recover_nvidia_runtime(logs=logs):
+                            break
+                        continue
+                    if "already in use" in str(exc).lower() or "name is already in use" in str(exc).lower():
+                        self._log(logs, "检测到容器名或端口冲突，已清理残留后重试。")
+                        continue
+                    if "ssh" in str(exc).lower():
+                        self._log(logs, "检测到 SSH 连接异常，等待后重试。")
+                        time.sleep(2)
+                        continue
+                    time.sleep(1)
+            if last_exc is not None:
+                raise last_exc
             self.prepare_x11_support(allocation)
             self.verify_container_access(allocation)
             allocation.status = AllocationStatus.RUNNING.value
             allocation.pending_rebuild = False
             allocation.pending_rebuild_reason = None
         except Exception:
-            self.cleanup_failed_container(allocation)
+            self.cleanup_failed_container(allocation, logs=logs)
             raise
 
     def update_resources(self, allocation: Allocation, logs: list[str] | None = None) -> None:

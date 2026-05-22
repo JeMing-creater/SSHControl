@@ -50,7 +50,8 @@
 <script>
 (() => {
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socketUrl = `${wsProtocol}//${window.location.host}/ws/hosts/{{ host.id }}/terminal`;
+    const terminalToken = {{ terminal_token|tojson }};
+    const socketUrl = `${wsProtocol}//${window.location.host}/ws/hosts/{{ host.id }}/terminal?token=${encodeURIComponent(terminalToken)}`;
     const progressWrap = document.getElementById("terminal-progress");
     const progressLabel = document.getElementById("terminal-progress-label");
     const progressFill = document.getElementById("terminal-progress-fill");

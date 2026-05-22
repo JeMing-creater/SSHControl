@@ -59,7 +59,7 @@
                 <h3>通过 SSH 接入服务器</h3>
             </div>
         </div>
-        <form class="form-grid confirm-ajax-form host-form" method="post" action="/hosts" data-confirm-message="确认保存该宿主机并接入平台？">
+        <form id="host-access-form" class="form-grid host-form" method="post" action="/hosts" data-confirm-message="确认保存该宿主机并接入平台？">
             <label><span class="required-mark">*</span>名称<input name="name" required></label>
             <label><span class="required-mark">*</span>地址<input name="address" required placeholder="10.0.0.12"></label>
             <label><span class="required-mark">*</span>SSH 端口<input name="ssh_port" type="number" value="22"></label>
@@ -78,9 +78,7 @@
             <label><span class="required-mark">*</span>/workspace 根目录<input name="workspace_root" value="/workspace/tenants"></label>
             <label><span class="required-mark">*</span>/mnt 共享路径<input name="shared_mnt_path" value="/mnt"></label>
             <label><span class="required-mark">*</span>快照根目录<input name="snapshot_root" value="/mnt/docker_platform_snapshots"></label>
-            <label><span class="required-mark">*</span>保底 CPU<input name="reserve_cpu_cores" type="number" step="1" value="8"></label>
-            <label><span class="required-mark">*</span>保底内存(GB)<input name="reserve_memory_gb" type="number" step="1" value="64"></label>
-            <label><span class="required-mark">*</span>保底磁盘(GB)<input name="reserve_disk_gb" type="number" step="1" value="200"></label>
+            <div class="wide form-note">平台资源分配上限按宿主机物理总量的 85% 自动计算，固定预留 15% 给宿主机基础运行。</div>
             <label><span class="required-mark">*</span>默认共享人数<input name="default_user_share" type="number" value="10"></label>
             <label><span class="required-mark">*</span>快照保留数
                 <select name="snapshot_keep_count">
@@ -130,4 +128,179 @@
         {% endfor %}
     </div>
 </section>
+
+<script>
+(() => {
+    const form = document.getElementById("host-access-form");
+    const testButton = document.getElementById("test-ssh");
+    const submitButton = document.getElementById("submit-setup");
+    if (!form || !testButton || !submitButton) {
+        return;
+    }
+
+    let verifiedSignature = "";
+
+    const signature = () => {
+        const data = new FormData(form);
+        return [
+            data.get("address"),
+            data.get("ssh_port"),
+            data.get("ssh_user"),
+            data.get("auth_type"),
+            data.get("ssh_password"),
+            data.get("ssh_key_path"),
+            data.get("port_start"),
+            data.get("port_end"),
+            data.get("workspace_root"),
+            data.get("shared_mnt_path"),
+            data.get("snapshot_root")
+        ].join("|");
+    };
+
+    const setButtonsBusy = (busy) => {
+        testButton.disabled = busy;
+        submitButton.disabled = busy || signature() !== verifiedSignature;
+        [testButton, submitButton].forEach((button) => {
+            button.classList.toggle("is-busy", busy);
+        });
+    };
+
+    const readStream = async (url, formData, { title, startMessage, successMessage, redirectOnDone = "" } = {}) => {
+        window.showGlobalFeedback?.(startMessage, "success", "", {
+            title,
+            showProgress: true,
+            showLog: true,
+            progress: 4,
+            reloadOnClose: false
+        });
+        window.showGlobalBusy?.(startMessage);
+        window.appendGlobalFeedbackLog?.(`${new Date().toLocaleTimeString()} ${startMessage}`);
+
+        const response = await fetch(url, {
+            method: "POST",
+            body: formData,
+            headers: {
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/x-ndjson"
+            }
+        });
+        if (!response.ok || !response.body) {
+            const text = await response.text();
+            throw new Error(`HTTP ${response.status}\n${text.slice(0, 2000)}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let lastEvent = null;
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+                break;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            for (const line of lines) {
+                if (!line.trim()) {
+                    continue;
+                }
+                const event = JSON.parse(line);
+                lastEvent = event;
+                if (typeof event.progress === "number") {
+                    window.setGlobalFeedbackProgress?.(event.progress);
+                }
+                if (event.message) {
+                    window.appendGlobalFeedbackLog?.(`${new Date().toLocaleTimeString()} ${event.message}`);
+                }
+                if (event.event === "error") {
+                    window.showGlobalFeedback?.(event.message || "操作失败。", "error", event.error_log || "", {
+                        title: "操作失败",
+                        showProgress: true,
+                        progress: event.progress || 100,
+                        preserveLog: true,
+                        reloadOnClose: false
+                    });
+                    return event;
+                }
+                if (event.event === "done") {
+                    window.showGlobalFeedback?.(event.message || successMessage || "操作完成。", "success", "", {
+                        title: "操作完成",
+                        showProgress: true,
+                        progress: event.progress || 100,
+                        showLog: true,
+                        preserveLog: true,
+                        redirectUrl: event.redirect_url || redirectOnDone,
+                        reloadOnClose: false
+                    });
+                    return event;
+                }
+            }
+        }
+        return lastEvent;
+    };
+
+    form.addEventListener("input", () => {
+        if (signature() !== verifiedSignature) {
+            submitButton.disabled = true;
+        }
+    });
+
+    testButton.addEventListener("click", async () => {
+        setButtonsBusy(true);
+        try {
+            const event = await readStream("/hosts/test/stream", new FormData(form), {
+                title: "检测 SSH 宿主机",
+                startMessage: "正在检测 SSH 与 Docker 环境...",
+                successMessage: "SSH 与 Docker 检测通过。"
+            });
+            if (event && event.ok) {
+                verifiedSignature = signature();
+                submitButton.disabled = false;
+            }
+        } catch (error) {
+            window.showGlobalFeedback?.("检测请求发送失败，请检查网络或后端状态。", "error", String(error), {
+                title: "操作失败",
+                showProgress: true,
+                progress: 100
+            });
+        } finally {
+            window.hideGlobalBusy?.();
+            testButton.disabled = false;
+            submitButton.disabled = signature() !== verifiedSignature;
+            testButton.classList.remove("is-busy");
+            submitButton.classList.remove("is-busy");
+        }
+    });
+
+    form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!window.confirm(form.dataset.confirmMessage || "确认保存该宿主机并接入平台？")) {
+            return;
+        }
+        setButtonsBusy(true);
+        try {
+            await readStream("/hosts/create/stream", new FormData(form), {
+                title: "保存 SSH 宿主机",
+                startMessage: "正在检测并保存 SSH 宿主机...",
+                successMessage: "宿主机已接入平台。",
+                redirectOnDone: "/hosts"
+            });
+        } catch (error) {
+            window.showGlobalFeedback?.("保存请求发送失败，请检查网络或后端状态。", "error", String(error), {
+                title: "操作失败",
+                showProgress: true,
+                progress: 100
+            });
+        } finally {
+            window.hideGlobalBusy?.();
+            testButton.disabled = false;
+            submitButton.disabled = signature() !== verifiedSignature;
+            testButton.classList.remove("is-busy");
+            submitButton.classList.remove("is-busy");
+        }
+    });
+})();
+</script>
 {% endblock %}
