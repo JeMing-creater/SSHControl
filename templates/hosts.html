@@ -41,7 +41,7 @@
                         <td>
                             <div>{{ '在线' if row.summary.reachable else '离线' }}</div>
                             <div class="status-timestamp">最后状态更新时间：{{ row.last_status_at }}</div>
-                            <form class="confirm-ajax-form" method="post" action="/hosts/{{ row.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？这不会删除远端服务器本身，只会删除平台记录。">
+                            <form class="confirm-ajax-form" method="post" action="/hosts/{{ row.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？如仍有合法分配，平台会先提示原因，并提供继续归档移除入口。">
                                 <button class="button tiny danger" type="submit">移除记录</button>
                             </form>
                         </td>

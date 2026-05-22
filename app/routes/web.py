@@ -42,6 +42,7 @@ router = APIRouter()
 settings = get_settings()
 beijing_tz = ZoneInfo("Asia/Shanghai")
 HOST_REFRESH_INTERVAL_SECONDS = 15 * 60
+ARCHIVED_HOST_NAME_PREFIX = "已移除-"
 
 
 def render(request: Request, template_name: str, context: dict):
@@ -203,9 +204,21 @@ def stream_event(event: str, **payload) -> str:
     return json.dumps(data, ensure_ascii=False) + "\n"
 
 
-def ssh_host_count(db: Session) -> int:
+def visible_hosts_query(db: Session):
     return (
         db.query(ManagedHost)
+        .filter(ManagedHost.enabled == True)  # noqa: E712
+        .filter(~ManagedHost.name.startswith(ARCHIVED_HOST_NAME_PREFIX))
+    )
+
+
+def visible_host_by_id(db: Session, host_id: int) -> ManagedHost | None:
+    return visible_hosts_query(db).filter(ManagedHost.id == host_id).first()
+
+
+def ssh_host_count(db: Session) -> int:
+    return (
+        visible_hosts_query(db)
         .filter(ManagedHost.auth_type.in_([AuthType.PASSWORD.value, AuthType.KEY.value]))
         .count()
     )
@@ -372,6 +385,17 @@ def remove_cached_container_row(db: Session, host_id: int, container_name: str) 
     return changed
 
 
+def ensure_host_status_cache(db: Session, host_id: int) -> HostStatusCache:
+    for instance in list(db.identity_map.values()) + list(db.new):
+        if isinstance(instance, HostStatusCache) and instance.host_id == host_id:
+            return instance
+    cache = db.query(HostStatusCache).filter(HostStatusCache.host_id == host_id).first()
+    if cache is None:
+        cache = HostStatusCache(host_id=host_id)
+        db.add(cache)
+    return cache
+
+
 def update_cached_container_status(
     db: Session,
     host_id: int,
@@ -386,12 +410,10 @@ def update_cached_container_status(
     if status == AllocationStatus.DELETED.value:
         return remove_cached_container_row(db, host_id, target)
 
-    cache = db.query(HostStatusCache).filter(HostStatusCache.host_id == host_id).first()
-    if not cache:
+    cache = ensure_host_status_cache(db, host_id)
+    if cache is None:
         if host_port is None:
             return False
-        cache = HostStatusCache(host_id=host_id)
-        db.add(cache)
 
     resolved_port = int(host_port) if host_port is not None else None
 
@@ -511,10 +533,7 @@ def upsert_cached_container_row(
     name = container_name.strip().lstrip("/")
     if not name:
         return False
-    cache = db.query(HostStatusCache).filter(HostStatusCache.host_id == host_id).first()
-    if not cache:
-        cache = HostStatusCache(host_id=host_id)
-        db.add(cache)
+    cache = ensure_host_status_cache(db, host_id)
 
     next_row = {
         "container_name": name,
@@ -711,7 +730,7 @@ def build_host_rows_from_cached_data(host: ManagedHost, db_allocations: list[All
 
 
 def compute_visual_payload(db: Session) -> dict:
-    hosts = db.query(ManagedHost).filter(ManagedHost.enabled == True).order_by(ManagedHost.name.asc()).all()  # noqa: E712
+    hosts = visible_hosts_query(db).order_by(ManagedHost.name.asc()).all()
     rows = []
     total_gpu_used_mb = 0.0
     total_gpu_memory_mb = 0.0
@@ -943,6 +962,134 @@ def validate_ssh_docker_with_logs(host: ManagedHost, logs: list[str], *, timeout
         "available_ports": available_ports,
         "images": discovered_images,
     }
+
+
+def reclaim_existing_allocations_for_host(
+    db: Session,
+    host: ManagedHost,
+    container_rows: list[dict],
+    logs: list[str] | None = None,
+) -> int:
+    if not container_rows:
+        return 0
+
+    active_allocations = (
+        db.query(Allocation)
+        .filter(Allocation.status != AllocationStatus.DELETED.value)
+        .all()
+    )
+    allocations_by_name = {
+        allocation.container_name: allocation
+        for allocation in active_allocations
+        if allocation.container_name
+    }
+    allocations_by_port_image: dict[tuple[int, str], list[Allocation]] = {}
+    for allocation in active_allocations:
+        try:
+            port = int(allocation.host_port)
+        except (TypeError, ValueError):
+            continue
+        image_name = (allocation.image_name or "").strip()
+        if image_name:
+            allocations_by_port_image.setdefault((port, image_name), []).append(allocation)
+
+    reclaimed = 0
+    for row in container_rows:
+        try:
+            host_port = int(row.get("host_port"))
+        except (TypeError, ValueError):
+            continue
+        container_name = str(row.get("container_name") or "").strip().lstrip("/")
+        image_name = str(row.get("image_name") or "").strip()
+        labels = (((row.get("detail") or {}).get("Config") or {}).get("Labels") or {})
+        labeled_container_name = str(labels.get("control.container_name") or "").strip().lstrip("/")
+        if not container_name:
+            continue
+
+        allocation = allocations_by_name.get(container_name)
+        if allocation is None and labeled_container_name:
+            allocation = allocations_by_name.get(labeled_container_name)
+        if allocation is None and image_name:
+            candidates = allocations_by_port_image.get((host_port, image_name), [])
+            if len(candidates) == 1:
+                allocation = candidates[0]
+        if allocation is None or allocation.host_id == host.id:
+            continue
+
+        old_host_id = allocation.host_id
+        allocation.host_id = host.id
+        allocation.host_port = host_port
+        allocation.container_name = container_name
+        if image_name:
+            allocation.image_name = image_name
+        allocation.status = row.get("status") or allocation.status
+        db.query(SnapshotRecord).filter(SnapshotRecord.allocation_id == allocation.id).update(
+            {SnapshotRecord.host_id: host.id}
+        )
+        reclaimed += 1
+        if logs is not None:
+            logs.append(
+                "自动认领旧平台分配："
+                f"端口 {host_port} / 容器 {container_name} 从 host_id={old_host_id} 迁移到 host_id={host.id}。"
+            )
+
+    return reclaimed
+
+
+def discover_and_reclaim_host_allocations(
+    db: Session,
+    host: ManagedHost,
+    logs: list[str] | None = None,
+    *,
+    timeout: int = 30,
+) -> int:
+    try:
+        rows = DockerService(host).managed_container_rows(host.port_start, host.port_end, timeout=timeout)
+    except RunnerError as exc:
+        if logs is not None:
+            logs.append(f"自动认领扫描失败，已跳过：{exc}")
+        return 0
+    reclaimed = reclaim_existing_allocations_for_host(db, host, rows, logs=logs)
+    for row in rows:
+        try:
+            upsert_cached_container_row(
+                db,
+                host.id,
+                row["container_name"],
+                int(row["host_port"]),
+                row.get("image_name") or "",
+                row.get("status") or AllocationStatus.STOPPED.value,
+            )
+        except Exception:
+            continue
+    if logs is not None:
+        logs.append(f"宿主机已有容器扫描完成，自动认领 {reclaimed} 条旧平台分配。")
+    return reclaimed
+
+
+def archive_host_record(db: Session, host: ManagedHost, logs: list[str] | None = None) -> tuple[int, int]:
+    active_allocations = (
+        db.query(Allocation)
+        .filter(
+            Allocation.host_id == host.id,
+            Allocation.status != AllocationStatus.DELETED.value,
+        )
+        .order_by(Allocation.host_port.asc())
+        .all()
+    )
+    snapshot_count = db.query(SnapshotRecord).filter(SnapshotRecord.host_id == host.id).count()
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    original_name = host.name
+    host.name = f"{ARCHIVED_HOST_NAME_PREFIX}{host.id}-{timestamp}-{original_name}"[:100]
+    host.enabled = False
+    archive_note = f"平台记录于 {timestamp} 归档移除；保留 {len(active_allocations)} 条合法分配用于重新接入自动认领。"
+    host.notes = ((host.notes or "").rstrip() + "\n" if host.notes else "") + archive_note
+    if logs is not None:
+        logs.append(f"宿主机记录已归档隐藏：{original_name} -> {host.name}")
+        logs.append(f"保留合法分配 {len(active_allocations)} 条，快照记录 {snapshot_count} 条。")
+        if active_allocations:
+            logs.append("后续如需恢复管理：重新接入同一 SSH 宿主机，平台会按容器名、标签或端口+镜像自动认领这些分配。")
+    return len(active_allocations), snapshot_count
 
 
 def parse_cached_images(raw: str | None) -> list[str]:
@@ -1192,7 +1339,7 @@ def dashboard(request: Request):
         platform_user = active_platform_user(request)
         if ssh_host_count(db) == 0 and not platform_user:
             return render_initial_setup(request)
-        hosts = db.query(ManagedHost).order_by(ManagedHost.name.asc()).all()
+        hosts = visible_hosts_query(db).order_by(ManagedHost.name.asc()).all()
         allocations_query = db.query(Allocation).order_by(Allocation.created_at.desc())
         if platform_user:
             allocations_query = allocations_query.filter(Allocation.assignee == platform_user["account"])
@@ -1254,7 +1401,7 @@ def hosts_page(request: Request):
     try:
         if ssh_host_count(db) == 0:
             return render_initial_setup(request)
-        hosts = db.query(ManagedHost).order_by(ManagedHost.name.asc()).all()
+        hosts = visible_hosts_query(db).order_by(ManagedHost.name.asc()).all()
         host_rows = []
         for host in hosts:
             cached = host_cache_payload(host)
@@ -1334,6 +1481,9 @@ def create_host(
         validate_ssh_docker(host)
         logs.append("探测通过，准备写入平台数据库")
         db.add(host)
+        db.flush()
+        logs.append("扫描宿主机已有容器，尝试自动认领旧平台分配")
+        discover_and_reclaim_host_allocations(db, host, logs=logs, timeout=60)
         db.commit()
     except RunnerError as exc:
         db.rollback()
@@ -1503,6 +1653,10 @@ def create_host_stream(
             db = SessionLocal()
             yield stream_event("log", message="检测通过，开始写入平台数据库。", progress=86)
             db.add(host)
+            db.flush()
+            yield stream_event("log", message="扫描宿主机已有容器，尝试自动认领旧平台分配。", progress=90)
+            discover_and_reclaim_host_allocations(db, host, logs=logs, timeout=60)
+            yield from emit_logs(progress=94)
             db.commit()
             yield stream_event("log", message="数据库写入完成，宿主机已纳入平台。", progress=96)
             yield stream_event(
@@ -1699,7 +1853,7 @@ def update_host_snapshot_policy(
 
     db: Session = SessionLocal()
     try:
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             return operation_error(request, "未找到宿主机记录。", "/hosts", status_code=404)
         host.snapshot_keep_count = max(snapshot_keep_count, 0)
@@ -1723,7 +1877,7 @@ def delete_host(request: Request, host_id: int):
 
     db: Session = SessionLocal()
     try:
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             return operation_error(request, "未找到宿主机记录。", redirect_url, status_code=404)
         active_allocations = (
@@ -1735,6 +1889,30 @@ def delete_host(request: Request, host_id: int):
             .count()
         )
         if active_allocations > 0:
+            message = (
+                "该宿主机仍存在未删除的容器分配记录，不能直接物理删除。"
+                "如确认只是移除平台宿主机入口，可继续执行归档移除：平台会隐藏该宿主机记录，"
+                "保留合法容器分配与快照记录，远端 Docker 容器不会被停止或删除；"
+                "之后重新接入同一 SSH 宿主机时会自动认领这些合法镜像。"
+            )
+            if wants_json(request):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "message": "该宿主机仍存在未删除的容器分配记录，不能直接物理删除。",
+                        "error_log": message,
+                        "next_action": {
+                            "type": "host_delete_stream",
+                            "url": f"/hosts/{host.id}/delete/stream",
+                            "label": "继续归档移除",
+                            "confirm": (
+                                "确认继续归档移除该宿主机入口？平台会保留合法分配记录与远端容器，"
+                                "但该宿主机会从总览和宿主机列表隐藏。"
+                            ),
+                        },
+                    },
+                    status_code=200,
+                )
             return operation_error(request, "该宿主机仍存在未删除的容器分配记录，暂不能移除。", redirect_url)
         db.delete(host)
         db.commit()
@@ -1746,12 +1924,99 @@ def delete_host(request: Request, host_id: int):
         db.close()
 
 
+@router.post("/hosts/{host_id}/delete/stream")
+def delete_host_stream(request: Request, host_id: int):
+    admin_response = require_admin_response(request, "/")
+    if admin_response:
+        return admin_response
+
+    def generate():
+        logs: list[str] = []
+        emitted = 0
+        db: Session | None = None
+
+        def emit_logs(progress: int | None = None):
+            nonlocal emitted
+            while emitted < len(logs):
+                emitted += 1
+                yield stream_event("log", message=logs[emitted - 1], progress=progress)
+
+        try:
+            yield stream_event("log", message=f"开始移除宿主机记录 host_id={host_id}", progress=5)
+            db = SessionLocal()
+            host = visible_host_by_id(db, host_id)
+            if not host:
+                yield stream_event("error", ok=False, message="未找到宿主机记录。", error_log=f"host_id={host_id}", progress=100)
+                return
+
+            yield stream_event("log", message=f"读取宿主机：{host.name} ({host.address}:{host.ssh_port})", progress=15)
+            active_allocations = (
+                db.query(Allocation)
+                .filter(
+                    Allocation.host_id == host.id,
+                    Allocation.status != AllocationStatus.DELETED.value,
+                )
+                .order_by(Allocation.host_port.asc())
+                .all()
+            )
+            yield stream_event("log", message=f"发现合法分配记录 {len(active_allocations)} 条。", progress=30)
+            if active_allocations:
+                host_display_name = host.name
+                yield stream_event("log", message="执行安全归档移除：仅隐藏宿主机入口，不停止、不删除远端 Docker 容器。", progress=45)
+                allocation_count, snapshot_count = archive_host_record(db, host, logs=logs)
+                yield from emit_logs(progress=65)
+                db.commit()
+                yield stream_event("log", message="数据库事务已提交，合法分配记录已保留。", progress=88)
+                yield stream_event(
+                    "done",
+                    ok=True,
+                    message=f"宿主机 {host_display_name} 已归档移除，保留 {allocation_count} 条合法分配和 {snapshot_count} 条快照记录。",
+                    progress=100,
+                    redirect_url="/hosts",
+                )
+                return
+
+            yield stream_event("log", message="未发现合法分配记录，执行物理删除平台宿主机记录。", progress=55)
+            host_name = host.name
+            db.delete(host)
+            db.commit()
+            yield stream_event("log", message="数据库事务已提交。", progress=90)
+            yield stream_event(
+                "done",
+                ok=True,
+                message=f"宿主机 {host_name} 已从平台记录中移除。",
+                progress=100,
+                redirect_url="/hosts",
+            )
+        except SQLAlchemyError as exc:
+            if db is not None:
+                db.rollback()
+            reason = str(exc).strip()
+            yield stream_event(
+                "error",
+                ok=False,
+                message="宿主机记录移除失败。",
+                error_log=f"{reason}\n数据库事务已回滚，未保留半写入状态。",
+                progress=100,
+            )
+        except Exception as exc:
+            if db is not None:
+                db.rollback()
+            reason = f"{type(exc).__name__}: {exc}"
+            yield stream_event("error", ok=False, message="宿主机记录移除失败。", error_log=reason, progress=100)
+        finally:
+            if db is not None:
+                db.close()
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
 @router.get("/hosts/{host_id}")
 def host_detail(request: Request, host_id: int):
     db: Session = SessionLocal()
     try:
         platform_user = active_platform_user(request)
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             return RedirectResponse("/hosts?error=未找到宿主机记录。", status_code=303)
         cached = host_cache_payload(host)
@@ -1882,7 +2147,7 @@ def host_terminal(request: Request, host_id: int):
     admin = getattr(request.state, "admin", None) or {}
     db: Session = SessionLocal()
     try:
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             return RedirectResponse("/hosts?error=未找到宿主机记录。", status_code=303)
         cached = host_cache_payload(host)
@@ -1916,7 +2181,7 @@ def host_terminal_run(
         return admin_response
     db: Session = SessionLocal()
     try:
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             return JSONResponse({"ok": False, "message": "未找到宿主机记录。", "error_log": f"host_id={host_id}"}, status_code=404)
         command_text = command.strip()
@@ -1980,7 +2245,7 @@ async def host_terminal_ws(websocket: WebSocket, host_id: int):
             )
             await websocket.close()
             return
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             await websocket.send_json({"event": "error", "message": "未找到宿主机记录。", "error_log": f"host_id={host_id}"})
             await websocket.close()
@@ -2302,7 +2567,7 @@ async def allocation_terminal_ws(websocket: WebSocket, allocation_id: int):
 def host_metrics(host_id: int):
     db: Session = SessionLocal()
     try:
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             return JSONResponse(
                 {"ok": False, "message": "未找到宿主机记录。", "error_log": f"host_id={host_id}"},
@@ -2436,7 +2701,7 @@ def create_allocation(
     container_name = ""
     logs: list[str] = []
     try:
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             return operation_error(request, "未找到宿主机记录。", "/hosts", status_code=404)
         if host_port < host.port_start or host_port > host.port_end:
@@ -2801,7 +3066,7 @@ def external_container_action(
         return admin_response
     db: Session = SessionLocal()
     try:
-        host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+        host = visible_host_by_id(db, host_id)
         if not host:
             response = ajax_response(request, False, "未找到宿主机记录。", status_code=404)
             if response:
@@ -2879,7 +3144,7 @@ def restart_all_host_containers_stream(request: Request, host_id: int):
     def generate():
         db: Session = SessionLocal()
         try:
-            host = db.query(ManagedHost).filter(ManagedHost.id == host_id).first()
+            host = visible_host_by_id(db, host_id)
             if not host:
                 yield stream_event("error", ok=False, message="未找到宿主机记录。", error_log=f"host_id={host_id}")
                 return

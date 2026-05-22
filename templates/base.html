@@ -70,6 +70,7 @@
                 </label>
                 <div class="wide modal-actions">
                     <button class="button secondary hidden" type="button" id="global-feedback-copy">复制日志</button>
+                    <button class="button danger hidden" type="button" id="global-feedback-action">继续操作</button>
                     <button class="button" type="button" id="global-feedback-close">知道了</button>
                 </div>
             </div>
@@ -86,6 +87,7 @@
         const logWrap = document.getElementById("global-feedback-log-wrap");
         const log = document.getElementById("global-feedback-log");
         const copy = document.getElementById("global-feedback-copy");
+        const action = document.getElementById("global-feedback-action");
         const close = document.getElementById("global-feedback-close");
         const toast = document.getElementById("global-toast");
         const toastBody = document.getElementById("global-toast-body");
@@ -97,6 +99,7 @@
         let busyTimer = null;
         let redirectUrl = "";
         let reloadOnClose = false;
+        let pendingAction = null;
 
         if (!modal) {
             return;
@@ -115,6 +118,13 @@
         const showModal = (text, type = "success", errorLog = "", options = {}) => {
             redirectUrl = options.redirectUrl || "";
             reloadOnClose = Boolean(options.reloadOnClose);
+            pendingAction = options.action || null;
+            if (action) {
+                action.textContent = pendingAction?.label || "继续操作";
+                action.classList.toggle("hidden", !pendingAction);
+                action.disabled = false;
+                action.classList.remove("is-busy");
+            }
             const preserveLog = Boolean(options.preserveLog);
             if (!preserveLog) {
                 logLines.length = 0;
@@ -201,9 +211,86 @@
             progressText.textContent = text || `${Math.round(value)}%`;
         };
 
+        const readFeedbackStream = async (url, formData = new FormData(), options = {}) => {
+            showModal(options.startMessage || "操作已开始，等待后端反馈...", "success", "", {
+                title: options.title || "操作进行中",
+                showProgress: true,
+                showLog: true,
+                progress: options.progress || 4,
+                preserveLog: false,
+                reloadOnClose: false
+            });
+            showBusy(options.startMessage || "后端正在执行...");
+            appendLog(`${new Date().toLocaleTimeString()} ${options.startMessage || "开始执行"}`);
+            const response = await fetch(url, {
+                method: options.method || "POST",
+                body: formData,
+                headers: {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/x-ndjson"
+                }
+            });
+            if (!response.ok || !response.body) {
+                const text = await response.text();
+                throw new Error(`HTTP ${response.status}\n${text.slice(0, 2000)}`);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let lastEvent = null;
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) {
+                    break;
+                }
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                    if (!line.trim()) {
+                        continue;
+                    }
+                    const event = JSON.parse(line);
+                    lastEvent = event;
+                    if (typeof event.progress === "number") {
+                        setModalProgress(event.progress);
+                    }
+                    if (event.message) {
+                        appendLog(`${new Date().toLocaleTimeString()} ${event.message}`);
+                    }
+                    if (event.event === "error") {
+                        showModal(event.message || "操作失败。", "error", event.error_log || "", {
+                            title: "操作失败",
+                            showProgress: true,
+                            progress: event.progress || 100,
+                            showLog: true,
+                            preserveLog: true,
+                            reloadOnClose: false
+                        });
+                        return event;
+                    }
+                    if (event.event === "done") {
+                        showModal(event.message || options.successMessage || "操作完成。", "success", "", {
+                            title: "操作完成",
+                            showProgress: true,
+                            progress: event.progress || 100,
+                            showLog: true,
+                            preserveLog: true,
+                            redirectUrl: event.redirect_url || options.redirectUrl || "",
+                            reloadOnClose: false
+                        });
+                        return event;
+                    }
+                }
+            }
+            return lastEvent;
+        };
+
         window.showGlobalFeedback = showModal;
         window.appendGlobalFeedbackLog = appendLog;
         window.setGlobalFeedbackProgress = setModalProgress;
+        window.readGlobalFeedbackStream = readFeedbackStream;
         window.showGlobalBusy = showBusy;
         window.hideGlobalBusy = hideBusy;
 
@@ -225,6 +312,35 @@
                 log.focus();
                 log.select();
                 showToast("自动复制失败，已选中错误日志，请手动复制。", "error");
+            }
+        });
+
+        action?.addEventListener("click", async () => {
+            if (!pendingAction) {
+                return;
+            }
+            const actionConfig = pendingAction;
+            if (actionConfig.confirm && !window.confirm(actionConfig.confirm)) {
+                return;
+            }
+            action.disabled = true;
+            action.classList.add("is-busy");
+            try {
+                await readFeedbackStream(actionConfig.url, new FormData(), {
+                    title: actionConfig.title || actionConfig.label || "继续操作",
+                    startMessage: actionConfig.startMessage || "正在继续执行，请等待后端反馈...",
+                    successMessage: actionConfig.successMessage || "操作完成。"
+                });
+            } catch (error) {
+                showModal("继续操作请求发送失败，请检查网络或后端状态。", "error", String(error), {
+                    title: "操作失败",
+                    showProgress: true,
+                    progress: 100
+                });
+            } finally {
+                hideBusy();
+                action.disabled = false;
+                action.classList.remove("is-busy");
             }
         });
 
@@ -277,7 +393,15 @@
                             }
                         );
                     } else {
-                        showModal(payload.message || "操作失败。", "error", payload.error_log || "");
+                        const nextAction = payload.next_action ? {
+                            ...payload.next_action,
+                            title: payload.next_action.title || payload.next_action.label || "继续操作",
+                            startMessage: payload.next_action.start_message || "正在继续移除宿主机记录...",
+                            successMessage: payload.next_action.success_message || "宿主机记录移除完成。"
+                        } : null;
+                        showModal(payload.message || "操作失败。", "error", payload.error_log || "", {
+                            action: nextAction
+                        });
                     }
                 } catch (error) {
                     showModal("请求发送失败，请检查网络或后端状态。", "error", String(error));

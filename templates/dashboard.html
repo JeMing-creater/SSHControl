@@ -76,7 +76,7 @@
         <div class="hero-actions">
             <a class="button secondary" href="/hosts/{{ card.host.id }}">进入宿主机</a>
             {% if not is_user_view %}
-            <form class="confirm-ajax-form" method="post" action="/hosts/{{ card.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？这不会删除远端服务器本身，只会删除平台记录。">
+            <form class="confirm-ajax-form" method="post" action="/hosts/{{ card.host.id }}/delete" data-confirm-message="确认从平台移除该宿主机记录？如仍有合法分配，平台会先提示原因，并提供继续归档移除入口。">
                 <button class="button danger" type="submit">移除记录</button>
             </form>
             {% endif %}
