@@ -51,11 +51,11 @@
                 <dd>{{ card.summary.active_allocations }}</dd>
             </div>
             <div>
-                <dt>CPU 配额</dt>
+                <dt>CPU 弹性上限</dt>
                 <dd>{{ "%.1f"|format(card.summary.allocated_cpu) }} / {{ "%.1f"|format(card.total_cpu) if card.total_cpu else '-' }}</dd>
             </div>
             <div>
-                <dt>内存配额</dt>
+                <dt>内存弹性上限</dt>
                 <dd>{{ "%.1f"|format(card.summary.allocated_memory_gb) }} / {{ "%.1f"|format(card.total_memory_gb) if card.total_memory_gb else '-' }} GB</dd>
             </div>
         </dl>

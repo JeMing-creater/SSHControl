@@ -72,7 +72,7 @@
             <label><span class="required-mark">*</span>/mnt 共享路径<input name="shared_mnt_path" value="/mnt"></label>
             <label><span class="required-mark">*</span>快照根目录<input name="snapshot_root" value="/mnt/docker_platform_snapshots"></label>
             <label><span class="required-mark">*</span>默认共享人数<input name="default_user_share" type="number" value="10"></label>
-            <div class="wide form-note">平台资源分配上限按宿主机物理总量的 85% 自动计算，固定预留 15% 给宿主机基础运行。</div>
+            <div class="wide form-note">平台额定可分配上限按宿主机物理总量的 85% 自动计算，固定预留 15% 给宿主机基础运行；容器输入值作为弹性上限，保障额度自动按 1/4 计算。</div>
             <label><span class="required-mark">*</span>快照保留数
                 <select name="snapshot_keep_count">
                     <option value="0">0 - 不自动备份</option>

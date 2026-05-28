@@ -61,8 +61,8 @@
                 </div>
                 <canvas data-resource-flow="gpu" width="680" height="170"></canvas>
                 <div class="resource-flow-stats">
-                    <span><em>平台可分配上限</em><strong data-flow-allocated="gpu">-</strong></span>
-                    <span><em>已登记分配</em><strong data-flow-reserved="gpu">-</strong></span>
+                    <span><em>平台额定上限</em><strong data-flow-allocated="gpu">-</strong></span>
+                    <span><em>弹性上限合计</em><strong data-flow-reserved="gpu">-</strong></span>
                 </div>
             </article>
             <article class="resource-flow-card cpu" data-resource-flow-card="cpu">
@@ -72,8 +72,9 @@
                 </div>
                 <canvas data-resource-flow="cpu" width="680" height="170"></canvas>
                 <div class="resource-flow-stats">
-                    <span><em>平台可分配上限</em><strong data-flow-allocated="cpu">-</strong></span>
-                    <span><em>已登记分配</em><strong data-flow-reserved="cpu">-</strong></span>
+                    <span><em>平台额定上限</em><strong data-flow-allocated="cpu">-</strong></span>
+                    <span><em>弹性上限合计</em><strong data-flow-reserved="cpu">-</strong></span>
+                    <span><em>保障额度合计</em><strong data-flow-guaranteed="cpu">-</strong></span>
                 </div>
             </article>
             <article class="resource-flow-card memory" data-resource-flow-card="memory">
@@ -83,8 +84,9 @@
                 </div>
                 <canvas data-resource-flow="memory" width="680" height="170"></canvas>
                 <div class="resource-flow-stats">
-                    <span><em>平台可分配上限</em><strong data-flow-allocated="memory">-</strong></span>
-                    <span><em>已登记分配</em><strong data-flow-reserved="memory">-</strong></span>
+                    <span><em>平台额定上限</em><strong data-flow-allocated="memory">-</strong></span>
+                    <span><em>弹性上限合计</em><strong data-flow-reserved="memory">-</strong></span>
+                    <span><em>保障额度合计</em><strong data-flow-guaranteed="memory">-</strong></span>
                 </div>
             </article>
             <article class="resource-flow-card disk" data-resource-flow-card="disk">
@@ -94,8 +96,9 @@
                 </div>
                 <canvas data-resource-flow="disk" width="680" height="170"></canvas>
                 <div class="resource-flow-stats">
-                    <span><em>平台可分配上限</em><strong data-flow-allocated="disk">-</strong></span>
-                    <span><em>已登记分配</em><strong data-flow-reserved="disk">-</strong></span>
+                    <span><em>平台额定上限</em><strong data-flow-allocated="disk">-</strong></span>
+                    <span><em>弹性上限合计</em><strong data-flow-reserved="disk">-</strong></span>
+                    <span><em>保障额度合计</em><strong data-flow-guaranteed="disk">-</strong></span>
                 </div>
             </article>
         </div>
@@ -284,9 +287,12 @@
             </label>
             <label><span class="required-mark">*</span>使用者<input id="assignee" name="assignee" required></label>
             <label><span class="required-mark">*</span>root 密码<input name="root_password" required></label>
-            <label><span class="required-mark">*</span>CPU 上限(核)<input name="cpu_limit_cores" type="number" step="1" value="{{ defaults.cpu_limit_cores|int }}"></label>
-            <label><span class="required-mark">*</span>内存上限(GB)<input name="memory_limit_gb" type="number" step="1" value="{{ defaults.memory_limit_gb|int }}"></label>
-            <label><span class="required-mark">*</span>/workspace 上限(GB)<input name="workspace_limit_gb" type="number" step="1" value="{{ defaults.workspace_limit_gb|int }}"></label>
+            <label><span class="required-mark">*</span>CPU 弹性上限(核)<input name="cpu_limit_cores" type="number" step="1" value="{{ defaults.cpu_limit_cores|int }}"></label>
+            <label><span class="required-mark">*</span>内存弹性上限(GB)<input name="memory_limit_gb" type="number" step="1" value="{{ defaults.memory_limit_gb|int }}"></label>
+            <label><span class="required-mark">*</span>/workspace 弹性上限(GB)<input name="workspace_limit_gb" type="number" step="1" value="{{ defaults.workspace_limit_gb|int }}"></label>
+            <label class="wide">
+                <small class="muted">上述输入作为弹性上限；平台自动按弹性上限的 1/4 向下取整且最低为 1 设置保障额度。准入时要求：本次弹性上限 + 其他容器 max(实时占用, 保障额度) 不超过平台额定上限。</small>
+            </label>
             <label class="wide"><span class="required-mark">*</span>使用目的<textarea name="purpose" rows="2" required>实验计算</textarea></label>
             <label class="wide">额外挂载 <span class="optional-mark">选填</span>
                 <textarea name="extra_mounts" rows="3" placeholder="/data/share:/data/share;/data2:/data2"></textarea>
@@ -497,22 +503,22 @@
                 <td>
                     {% if row.registered and not is_user_view %}
                     <form class="inline-form async-form" method="post" action="/allocations/{{ row.allocation.id }}/resources">
-                        <label class="resource-field">CPU 上限(核)
+                        <label class="resource-field">CPU 弹性上限(核)
                             <input name="cpu_limit_cores" type="number" step="0.1" value="{{ row.allocation.cpu_limit_cores }}">
                         </label>
-                        <label class="resource-field">内存上限(GB)
+                        <label class="resource-field">内存弹性上限(GB)
                             <input name="memory_limit_gb" type="number" step="0.1" value="{{ row.allocation.memory_limit_gb }}">
                         </label>
-                        <label class="resource-field">workspace 上限(GB)
+                        <label class="resource-field">workspace 弹性上限(GB)
                             <input name="workspace_limit_gb" type="number" step="0.1" value="{{ row.allocation.workspace_limit_gb }}">
                         </label>
                         <button class="button tiny async-submit-button" type="submit">更新</button>
                     </form>
-                    <small class="muted">CPU / 内存可热更新；workspace 目前作为记录值。</small>
+                    <small class="muted">CPU / 内存可热更新；/dev/shm 会同步尝试热调整，若宿主机拒绝则需重建后生效；workspace 目前作为记录值。保障额度自动按弹性上限 1/4 计算。</small>
                     {% elif row.registered %}
-                    <div>CPU 上限 {{ row.allocation.cpu_limit_cores }} 核</div>
-                    <div>内存上限 {{ row.allocation.memory_limit_gb }} GB</div>
-                    <div>workspace 上限 {{ row.allocation.workspace_limit_gb }} GB</div>
+                    <div>CPU 弹性上限 {{ row.allocation.cpu_limit_cores }} 核</div>
+                    <div>内存弹性上限 {{ row.allocation.memory_limit_gb }} GB</div>
+                    <div>workspace 弹性上限 {{ row.allocation.workspace_limit_gb }} GB</div>
                     {% else %}
                     <button class="ghost-field unregistered-field" type="button">原始 CPU / 内存 / workspace 设定</button>
                     {% endif %}
@@ -566,6 +572,13 @@
                         </form>
                         {% endif %}
                         {% if row.status != "deleted" %}
+                        {% if row.status == "running" %}
+                        <form class="allocation-action-form" method="post" action="{{ '/allocations/' ~ row.allocation.id ~ '/action' if row.registered else '/hosts/' ~ host.id ~ '/containers/action' }}">
+                            <input type="hidden" name="action" value="restart">
+                            {% if not row.registered %}<input type="hidden" name="container_name" value="{{ row.container_name }}">{% endif %}
+                            <button class="button tiny secondary allocation-action-button" type="submit" data-action-label="重启" data-assignee="{{ row.assignee }}" data-port="{{ row.host_port }}">重启</button>
+                        </form>
+                        {% endif %}
                         <form class="allocation-action-form" method="post" action="{{ '/allocations/' ~ row.allocation.id ~ '/action' if row.registered else '/hosts/' ~ host.id ~ '/containers/action' }}">
                             <input type="hidden" name="action" value="delete">
                             {% if not row.registered %}<input type="hidden" name="container_name" value="{{ row.container_name }}">{% endif %}
@@ -592,11 +605,11 @@
                         >
                             连接信息
                         </button>
-                        {% if row.allocation.snapshot_policy_override %}
-                        <small class="muted">当前端口使用独立快照策略：{{ row.effective_snapshot_keep_count }} 份 / {{ row.effective_snapshot_interval_days }} 天</small>
-                        {% endif %}
                         {% endif %}
                     </div>
+                    {% if row.registered and row.allocation.snapshot_policy_override %}
+                    <small class="muted action-row-note">当前端口使用独立快照策略：{{ row.effective_snapshot_keep_count }} 份 / {{ row.effective_snapshot_interval_days }} 天</small>
+                    {% endif %}
                     {% endif %}
                 </td>
             </tr>
@@ -1106,6 +1119,12 @@ window.addEventListener("DOMContentLoaded", () => {
         memory: Number({{ (summary.get('allocated_memory_gb') or 0) | tojson }}),
         disk: Number({{ (summary.get('allocated_disk_gb') or 0) | tojson }})
     };
+    let resourceFlowGuaranteed = {
+        gpu: 0,
+        cpu: Number({{ (summary.get('guaranteed_cpu') or 0) | tojson }}),
+        memory: Number({{ (summary.get('guaranteed_memory_gb') or 0) | tojson }}),
+        disk: Number({{ (summary.get('guaranteed_disk_gb') or 0) | tojson }})
+    };
     const resourceSortKey = document.getElementById("resource-sort-key");
     const resourceToggle = document.getElementById("resource-toggle");
     const resourceChart = document.getElementById("resource-chart");
@@ -1121,7 +1140,8 @@ window.addEventListener("DOMContentLoaded", () => {
     const resourceFlowValueEls = {
         total: new Map([...document.querySelectorAll("[data-flow-total]")].map((item) => [item.dataset.flowTotal, item])),
         allocated: new Map([...document.querySelectorAll("[data-flow-allocated]")].map((item) => [item.dataset.flowAllocated, item])),
-        reserved: new Map([...document.querySelectorAll("[data-flow-reserved]")].map((item) => [item.dataset.flowReserved, item]))
+        reserved: new Map([...document.querySelectorAll("[data-flow-reserved]")].map((item) => [item.dataset.flowReserved, item])),
+        guaranteed: new Map([...document.querySelectorAll("[data-flow-guaranteed]")].map((item) => [item.dataset.flowGuaranteed, item]))
     };
     const resourceMonitorState = document.getElementById("resource-monitor-state");
     const hostRefreshState = document.getElementById("host-refresh-state");
@@ -1189,7 +1209,7 @@ window.addEventListener("DOMContentLoaded", () => {
             unit: "%",
             valueKey: "cpu_percent",
             limitKey: "cpu_limit_cores",
-            limitLabel: "CPU 上限",
+            limitLabel: "CPU 弹性上限",
             colorClass: "cpu"
         },
         memory: {
@@ -1197,7 +1217,7 @@ window.addEventListener("DOMContentLoaded", () => {
             unit: "GB",
             valueKey: "memory_used_gb",
             limitKey: "memory_limit_gb",
-            limitLabel: "内存上限",
+            limitLabel: "内存弹性上限",
             colorClass: "memory"
         },
         gpu: {
@@ -1212,8 +1232,8 @@ window.addEventListener("DOMContentLoaded", () => {
             label: "Docker 磁盘占用",
             unit: "GB",
             valueKey: "disk_used_gb",
-            limitKey: null,
-            limitLabel: "",
+            limitKey: "workspace_limit_gb",
+            limitLabel: "workspace 弹性上限",
             colorClass: "disk"
         }
     };
@@ -1296,6 +1316,7 @@ window.addEventListener("DOMContentLoaded", () => {
             const totalEl = resourceFlowValueEls.total.get(key);
             const allocatedEl = resourceFlowValueEls.allocated.get(key);
             const reservedEl = resourceFlowValueEls.reserved.get(key);
+            const guaranteedEl = resourceFlowValueEls.guaranteed.get(key);
             if (!totalEl || !allocatedEl || !reservedEl) {
                 return;
             }
@@ -1306,6 +1327,9 @@ window.addEventListener("DOMContentLoaded", () => {
                 ? formatFlowValue(platformLimit, key, "allocated")
                 : "-";
             reservedEl.textContent = formatFlowValue(resourceFlowReserved[key] || 0, key, "reserved");
+            if (guaranteedEl) {
+                guaranteedEl.textContent = formatFlowValue(resourceFlowGuaranteed[key] || 0, key, "guaranteed");
+            }
             resourceFlowCards.get(key)?.classList.toggle("is-warning", isResourceNearLimit(key, totals[key]));
         });
     };
@@ -1541,7 +1565,7 @@ window.addEventListener("DOMContentLoaded", () => {
             const limitText = key === "gpu"
                 ? formatGpuDetail(row.gpu_memory_detail)
                 : meta.limitKey
-                ? `${meta.limitLabel} ${formatMetricValue(row[meta.limitKey], meta.unit === "%" ? "核" : meta.unit)}`
+                ? `${meta.limitLabel} ${formatMetricValue(row[meta.limitKey], meta.unit === "%" ? "核" : meta.unit)}，保障 ${formatMetricValue(row[key === "cpu" ? "cpu_guarantee_cores" : key === "memory" ? "memory_guarantee_gb" : "workspace_guarantee_gb"], meta.unit === "%" ? "核" : meta.unit)}`
                 : (key === "disk" ? "Docker writable layer 占用" : "默认共享全部 GPU");
             return `
                 <article class="resource-bar-card">
@@ -1588,6 +1612,9 @@ window.addEventListener("DOMContentLoaded", () => {
             cpu_limit_cores: Number(row.cpu_limit_cores || 0),
             memory_limit_gb: Number(row.memory_limit_gb || 0),
             workspace_limit_gb: Number(row.workspace_limit_gb || 0),
+            cpu_guarantee_cores: Number(row.cpu_guarantee_cores || 0),
+            memory_guarantee_gb: Number(row.memory_guarantee_gb || 0),
+            workspace_guarantee_gb: Number(row.workspace_guarantee_gb || 0),
         }));
         pushResourceFlowPoint(resourceTotalsFromRows(resourceChartRows));
     };
@@ -1599,6 +1626,12 @@ window.addEventListener("DOMContentLoaded", () => {
                 cpu: sumRows(resourceChartRows, "cpu_limit_cores"),
                 memory: sumRows(resourceChartRows, "memory_limit_gb"),
                 disk: sumRows(resourceChartRows, "workspace_limit_gb")
+            };
+            resourceFlowGuaranteed = {
+                gpu: 0,
+                cpu: sumRows(resourceChartRows, "cpu_guarantee_cores"),
+                memory: sumRows(resourceChartRows, "memory_guarantee_gb"),
+                disk: sumRows(resourceChartRows, "workspace_guarantee_gb")
             };
             updateResourceFlowStats();
             return;
@@ -1612,8 +1645,29 @@ window.addEventListener("DOMContentLoaded", () => {
         updateResourceFlowStats();
     };
 
+    const mergeGuaranteedTotals = (guaranteed) => {
+        if (!guaranteed || typeof guaranteed !== "object") {
+            resourceFlowGuaranteed = {
+                gpu: 0,
+                cpu: sumRows(resourceChartRows, "cpu_guarantee_cores"),
+                memory: sumRows(resourceChartRows, "memory_guarantee_gb"),
+                disk: sumRows(resourceChartRows, "workspace_guarantee_gb")
+            };
+            updateResourceFlowStats();
+            return;
+        }
+        resourceFlowGuaranteed = {
+            gpu: Number(guaranteed.gpu || 0),
+            cpu: Number(guaranteed.cpu || 0),
+            memory: Number(guaranteed.memory || 0),
+            disk: Number(guaranteed.disk || 0)
+        };
+        updateResourceFlowStats();
+    };
+
     pushResourceFlowPoint(resourceTotalsFromRows(resourceChartRows), true);
     mergeAllocatedTotals();
+    mergeGuaranteedTotals();
     updateResourceFlowStats();
     resizeResourceFlow();
     requestAnimationFrame(drawResourceFlow);
@@ -1656,6 +1710,7 @@ window.addEventListener("DOMContentLoaded", () => {
             if (response.ok && payload.ok) {
                 mergeMetricRows(payload.rows || []);
                 mergeAllocatedTotals(payload.allocated);
+                mergeGuaranteedTotals(payload.guaranteed);
                 renderResourceChart();
                 if (window.updateHostVisualHeatRows) {
                     window.updateHostVisualHeatRows(resourceChartRows);

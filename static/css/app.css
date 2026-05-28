@@ -666,6 +666,7 @@ code {
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    flex: 0 0 auto;
     border: none;
     border-radius: 12px;
     padding: 10px 14px;
@@ -673,6 +674,7 @@ code {
     color: #fff;
     font-weight: 700;
     text-decoration: none;
+    white-space: nowrap;
     cursor: pointer;
 }
 
@@ -853,10 +855,36 @@ textarea {
 
 .action-row {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     justify-content: flex-end;
-    gap: 8px;
+    align-items: center;
+    gap: clamp(3px, 0.55vw, 8px);
     margin-top: 10px;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.action-row form {
+    display: inline-flex;
+    flex: 0 1 auto;
+    min-width: 0;
+}
+
+.action-row .button {
+    flex: 0 1 auto;
+    min-width: 0;
+}
+
+.action-row .button.tiny {
+    padding-inline: clamp(5px, 0.8vw, 10px);
+    font-size: clamp(0.68rem, 0.72vw, 0.82rem);
+    border-radius: 10px;
+}
+
+.action-row-note {
+    display: block;
+    margin-top: 6px;
+    text-align: right;
 }
 
 .warn-text {
@@ -1440,7 +1468,7 @@ textarea {
 
 .resource-flow-stats {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
     gap: 8px;
     margin-top: 8px;
 }

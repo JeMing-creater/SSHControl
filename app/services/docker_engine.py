@@ -11,6 +11,17 @@ from app.services.image_filters import filter_supported_base_images
 from app.services.ssh_client import RunnerError, get_runner
 
 
+SHM_REBUILD_REASON = (
+    "/dev/shm 运行态已按内存弹性上限临时同步；Docker HostConfig 需要重建容器后才能持久生效，"
+    "普通重启前请先执行平台重建启动。"
+)
+SHM_REBUILD_FAILED_REASON = (
+    "/dev/shm 共享内存大小无法热更新；当前 Docker 内存上限已更新，"
+    "共享内存将在下次重建容器时按内存弹性上限生效。"
+)
+REMOTE_COMMAND_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
 def slugify(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip())
     cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
@@ -62,6 +73,66 @@ def parse_docker_size_to_gb(value: str | None) -> float:
     return number * factors.get(unit, 0.0)
 
 
+def redact_sensitive_text(value: str | BaseException) -> str:
+    text = str(value or "")
+    if not text:
+        return text
+    return re.sub(
+        r"(PASSWORD=)(?:'[^']*'|\"[^\"]*\"|\S+)",
+        r"\1******",
+        text,
+    )
+
+
+def memory_gb_to_docker_size(value: float | int | None) -> str:
+    numeric = max(float(value or 0.0), 1.0)
+    if numeric.is_integer():
+        return f"{int(numeric)}g"
+    return f"{numeric:g}g"
+
+
+def append_rebuild_reason(allocation: Allocation, reason: str) -> None:
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        return
+    existing = (allocation.pending_rebuild_reason or "").strip()
+    if normalized_reason in existing:
+        allocation.pending_rebuild = True
+        return
+    allocation.pending_rebuild = True
+    allocation.pending_rebuild_reason = f"{existing}；{normalized_reason}" if existing else normalized_reason
+
+
+def explain_backend_error(raw: str | BaseException) -> str:
+    text = str(raw or "").strip()
+    lower = text.lower()
+    if not text:
+        return "后端命令执行失败，但未返回详细错误。"
+    if "address already in use" in lower or "port is already allocated" in lower:
+        return "端口已被占用，请更换端口或先清理占用该端口的旧容器。"
+    if "no such image" in lower or "pull access denied" in lower:
+        return "宿主机本地没有找到指定基础镜像，请重新选择本机已有镜像。"
+    if "no space left on device" in lower:
+        return "宿主机磁盘空间不足，Docker 无法继续写入。"
+    if "minimum memory limit" in lower or "memoryswap" in lower or ("memory" in lower and "invalid" in lower):
+        return "Docker 内存上限参数不合法，请调高内存弹性上限后重试。"
+    if "cannot update memory limit" in lower or "memory limit should be smaller" in lower:
+        return "Docker 拒绝更新内存上限，可能低于当前容器实际占用或 Docker 允许范围。"
+    if "name is already in use" in lower or ("conflict" in lower and "container" in lower):
+        return "容器名已被占用，平台会尝试清理残留后重试。"
+    if "driver/library version mismatch" in lower or "failed to initialize nvml" in lower:
+        return "NVIDIA 驱动与 NVML 库版本不匹配，需要修复宿主机 GPU 驱动环境。"
+    if "nvidia-container" in lower or "nvidia runtime" in lower:
+        return "NVIDIA 容器运行时异常，平台会尝试无破坏修复后重试。"
+    if "permission denied" in lower:
+        return "权限不足，当前 SSH 用户无法完成该 Docker 操作。"
+    if "timeout" in lower or "timed out" in lower:
+        return "远端命令执行超时，请检查 SSH、Docker 负载或稍后重试。"
+    if "ssh" in lower:
+        return "SSH 连接或远端命令执行失败，请检查宿主机网络和 SSH 服务。"
+    return "后端命令执行失败，原始错误已保留在下方日志。"
+
+
 def _container_host_ports(detail: dict) -> set[int]:
     ports: set[int] = set()
     port_bindings = detail.get("HostConfig", {}).get("PortBindings", {}) or {}
@@ -80,9 +151,15 @@ class DockerService:
         self.host = host
         self.runner = get_runner(host)
 
+    def _host_command(self, command: str) -> str:
+        return f"export PATH={REMOTE_COMMAND_PATH}:$PATH; {command}"
+
+    def _run_result(self, command: str, timeout: int = 120):
+        return self.runner.run(self._host_command(command), timeout=timeout)
+
     def _log(self, logs: list[str] | None, message: str) -> None:
         if logs is not None:
-            logs.append(message)
+            logs.append(redact_sensitive_text(message))
 
     def _run_with_retries(
         self,
@@ -102,7 +179,8 @@ class DockerService:
                 return result
             except RunnerError as exc:
                 last_exc = exc
-                self._log(logs, f"[失败] {exc}")
+                self._log(logs, f"[失败] {explain_backend_error(exc)}")
+                self._log(logs, f"[原始错误] {exc}")
                 if not recoverable or attempt > retries:
                     break
                 if "already in use" in str(exc).lower() or "name is already in use" in str(exc).lower():
@@ -123,15 +201,15 @@ class DockerService:
 
     def _run(self, command: str, timeout: int = 120) -> str:
         try:
-            result = self.runner.run(command, timeout=timeout)
+            result = self._run_result(command, timeout=timeout)
         except RunnerError as exc:
             if not exc.command:
-                exc.command = command
+                exc.command = redact_sensitive_text(command)
             raise
         if not result.ok:
             raise RunnerError(
                 result.stderr or result.stdout or f"Command failed: {command}",
-                command=command,
+                command=redact_sensitive_text(command),
                 exit_code=result.exit_code,
                 stderr=result.stderr,
                 stdout=result.stdout,
@@ -157,8 +235,9 @@ class DockerService:
 
     def recover_nvidia_runtime(self, logs: list[str] | None = None) -> bool:
         self._log(logs, "检测到 NVIDIA runtime 异常，尝试无破坏修复 nvidia-persistenced。")
-        script = """
+        script = f"""
 set -u
+export PATH={REMOTE_COMMAND_PATH}:$PATH
 if [ -S /run/nvidia-persistenced/socket ]; then
     echo "nvidia-persistenced socket 已存在。"
     exit 0
@@ -185,7 +264,7 @@ tail -40 /tmp/control-nvidia-persistenced.log 2>/dev/null >&2 || true
 nvidia-smi 2>&1 | head -40 >&2 || true
 exit 1
 """
-        result = self.runner.run(f"sh -lc {shlex.quote(script)}", timeout=90)
+        result = self._run_result(f"sh -c {shlex.quote(script)}", timeout=90)
         if result.ok:
             self._log(logs, result.stdout.strip() or "nvidia-persistenced 修复命令已完成。")
             return True
@@ -207,7 +286,7 @@ exit 1
             "docker inspect -f '{{.State.Status}}' "
             f"{shlex.quote(container_name)}"
         )
-        result = self.runner.run(command, timeout=30)
+        result = self._run_result(command, timeout=30)
         if result.ok:
             return True, (result.stdout or "").strip() or None
 
@@ -230,7 +309,7 @@ exit 1
             return
 
         command = f"docker rm -f {shlex.quote(container_name)}"
-        result = self.runner.run(command, timeout=600)
+        result = self._run_result(command, timeout=600)
         if result.ok:
             return
 
@@ -299,7 +378,7 @@ exit 1
 
         root_dir = str(info.get("DockerRootDir") or "/var/lib/docker").strip() or "/var/lib/docker"
         try:
-            result = self.runner.run(f"findmnt -no OPTIONS {shlex.quote(root_dir)}", timeout=min(timeout, 30))
+            result = self._run_result(f"findmnt -no OPTIONS {shlex.quote(root_dir)}", timeout=min(timeout, 30))
         except RunnerError:
             return False
         if not result.ok:
@@ -329,6 +408,79 @@ exit 1
 
         self._log(logs, "当前宿主机不支持 Docker writable-layer 磁盘限额，已仅保留平台准入控制。")
         return None
+
+    def configured_shm_size_bytes(self, allocation: Allocation, timeout: int = 30) -> int:
+        command = (
+            "docker inspect -f '{{.HostConfig.ShmSize}}' "
+            f"{shlex.quote(allocation.container_name)}"
+        )
+        raw = self._run(command, timeout=timeout).strip()
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    def runtime_shm_size_bytes(self, allocation: Allocation, timeout: int = 30) -> int:
+        script = f"""
+set -eu
+export PATH={REMOTE_COMMAND_PATH}:$PATH
+name={shlex.quote(allocation.container_name)}
+if line=$(docker exec "$name" df -B1 /dev/shm 2>/dev/null | tail -n 1) && [ -n "$line" ]; then
+    set -- $line
+    printf '%s\\n' "$2"
+    exit 0
+fi
+line=$(docker exec "$name" df -k /dev/shm | tail -n 1)
+set -- $line
+printf '%s\\n' "$(($2 * 1024))"
+"""
+        raw = self._run(f"sh -c {shlex.quote(script)}", timeout=timeout).strip()
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    def desired_shm_size_bytes(self, allocation: Allocation) -> int:
+        return int(max(float(allocation.memory_limit_gb or 0.0), 1.0) * (1024**3))
+
+    def sync_runtime_shm_size(self, allocation: Allocation, logs: list[str] | None = None) -> bool:
+        desired_size = memory_gb_to_docker_size(allocation.memory_limit_gb)
+        current_size = self.runtime_shm_size_bytes(allocation)
+        desired_bytes = self.desired_shm_size_bytes(allocation)
+        if current_size >= desired_bytes:
+            self._log(logs, f"/dev/shm 当前已满足内存弹性上限：{current_size / (1024**3):.1f} GB。")
+            return True
+
+        script = f"""
+set -eu
+export PATH={REMOTE_COMMAND_PATH}:$PATH
+name={shlex.quote(allocation.container_name)}
+size={shlex.quote(desired_size)}
+pid=$(docker inspect -f '{{{{.State.Pid}}}}' "$name")
+if [ -z "$pid" ] || [ "$pid" = "0" ]; then
+    echo "容器未运行，无法热调整 /dev/shm。"
+    exit 2
+fi
+if ! command -v nsenter >/dev/null 2>&1; then
+    echo "宿主机缺少 nsenter，无法热调整 /dev/shm。"
+    exit 3
+fi
+nsenter --target "$pid" --mount -- mount -o remount,size="$size" /dev/shm
+docker exec "$name" df -h /dev/shm | tail -1
+"""
+        command = f"sh -c {shlex.quote(script)}"
+        try:
+            output = self._run_with_retries(command, timeout=30, logs=logs, retries=0, recoverable=False)
+        except RunnerError as exc:
+            self._log(
+                logs,
+                "/dev/shm 无法热调整；Docker 不支持 docker update 修改共享内存，"
+                "该值将在下次重建容器时按内存弹性上限生效。",
+            )
+            self._log(logs, f"/dev/shm 热调整失败原因：{exc}")
+            return False
+        self._log(logs, f"/dev/shm 已临时调整为 {desired_size}。{output.strip()}")
+        return True
 
     def filesystem_usage_gb(self, path: str | None = None, timeout: int = 120) -> dict[str, float | str]:
         target = (path or self.host.workspace_root or "/").strip() or "/"
@@ -365,7 +517,7 @@ if output=$(LC_ALL=C "$df_bin" -k "$target" 2>/dev/null | last_line) && [ -n "$o
 fi
 exit 1
 """
-        result = self.runner.run(f"sh -lc {shlex.quote(script)}", timeout=timeout)
+        result = self._run_result(f"sh -c {shlex.quote(script)}", timeout=timeout)
         if not result.ok or not result.stdout.strip():
             return {}
 
@@ -437,7 +589,7 @@ exit 1
         return images
 
     def images_from_root_dockerfile(self, timeout: int = 30) -> list[str]:
-        result = self.runner.run("cat /root/Dockerfile", timeout=timeout)
+        result = self._run_result("cat /root/Dockerfile", timeout=timeout)
         if not result.ok or not result.stdout.strip():
             return []
         return self._images_from_dockerfile_text(result.stdout)
@@ -470,7 +622,7 @@ exit 1
             "\\( -name Dockerfile -o -name dockerfile \\) 2>/dev/null | head -20 | "
             "while read -r file; do echo '###'\"$file\"; cat \"$file\"; done"
         )
-        result = self.runner.run(command, timeout=command_timeout)
+        result = self._run_result(command, timeout=command_timeout)
         if not result.ok or not result.stdout.strip():
             return []
         return filter_supported_base_images(self._images_from_dockerfile_text(result.stdout))
@@ -527,7 +679,7 @@ exit 1
         return parse_json_lines(raw)
 
     def container_id_name_map(self, timeout: int = 120) -> dict[str, str]:
-        raw = self.runner.run(
+        raw = self._run_result(
             "docker ps -q --no-trunc | xargs -r docker inspect --format '{{.Id}} {{.Name}}'",
             timeout=timeout,
         )
@@ -610,7 +762,7 @@ exit 1
             except ValueError:
                 continue
 
-            cgroup_result = self.runner.run(f"cat /proc/{pid}/cgroup", timeout=min(timeout, 15))
+            cgroup_result = self._run_result(f"cat /proc/{pid}/cgroup", timeout=min(timeout, 15))
             if not cgroup_result.ok or not cgroup_result.stdout.strip():
                 continue
 
@@ -684,7 +836,7 @@ exit 1
 
             all_ready = True
             for check in checks:
-                result = self.runner.run(
+                result = self._run_result(
                     f"docker exec {shlex.quote(allocation.container_name)} sh -lc {shlex.quote(check)}",
                     timeout=15,
                 )
@@ -704,7 +856,7 @@ exit 1
     def cleanup_failed_container(self, allocation: Allocation, logs: list[str] | None = None) -> None:
         self.ensure_container_absent(allocation.container_name)
         workspace_dir = f"{self.host.workspace_root}/{allocation.container_name}"
-        result = self.runner.run(f"rmdir {shlex.quote(workspace_dir)} 2>/dev/null || true", timeout=30)
+        result = self._run_result(f"rmdir {shlex.quote(workspace_dir)} 2>/dev/null || true", timeout=30)
         if result.ok:
             self._log(logs, "已清理失败创建留下的空工作目录；非空目录会被保留以避免误删数据。")
 
@@ -779,6 +931,8 @@ fi
             f"-p {allocation.host_port}:22",
             f"--cpus {allocation.cpu_limit_cores}",
             f"--memory {allocation.memory_limit_gb}g",
+            f"--memory-swap {allocation.memory_limit_gb}g",
+            f"--shm-size {memory_gb_to_docker_size(allocation.memory_limit_gb)}",
             storage_opt or "",
             "--gpus all" if allocation.all_gpus_visible else "",
             "--label control.platform=1",
@@ -806,7 +960,8 @@ fi
                     break
                 except RunnerError as exc:
                     last_exc = exc
-                    self._log(logs, f"[失败] {exc}")
+                    self._log(logs, f"[失败] {explain_backend_error(exc)}")
+                    self._log(logs, f"[原始错误] {exc}")
                     try:
                         self._log(logs, "清理本次失败创建留下的同名容器，避免污染下一次重试。")
                         self.ensure_container_absent(allocation.container_name)
@@ -845,13 +1000,21 @@ fi
         command = (
             f"docker update --cpus {allocation.cpu_limit_cores} "
             f"--memory {allocation.memory_limit_gb}g "
+            f"--memory-swap {allocation.memory_limit_gb}g "
             f"{shlex.quote(allocation.container_name)}"
         )
         self._run_with_retries(command, logs=logs, retries=1)
+        configured_shm_ok = self.configured_shm_size_bytes(allocation) >= self.desired_shm_size_bytes(allocation)
+        shm_synced = self.sync_runtime_shm_size(allocation, logs=logs)
+        if not configured_shm_ok:
+            append_rebuild_reason(
+                allocation,
+                SHM_REBUILD_REASON if shm_synced else SHM_REBUILD_FAILED_REASON,
+            )
 
     def stop_container(self, allocation: Allocation) -> None:
         command = f"docker stop {shlex.quote(allocation.container_name)}"
-        result = self.runner.run(command, timeout=600)
+        result = self._run_result(command, timeout=600)
         if not result.ok:
             exists, runtime_status = self.inspect_container_runtime(allocation.container_name)
             if not exists:
@@ -871,7 +1034,7 @@ fi
 
     def stop_container_by_name(self, container_name: str) -> str:
         command = f"docker stop {shlex.quote(container_name)}"
-        result = self.runner.run(command, timeout=600)
+        result = self._run_result(command, timeout=600)
         if not result.ok:
             exists, runtime_status = self.inspect_container_runtime(container_name)
             if not exists:
@@ -889,7 +1052,7 @@ fi
 
     def start_container(self, allocation: Allocation) -> None:
         command = f"docker start {shlex.quote(allocation.container_name)}"
-        result = self.runner.run(command, timeout=600)
+        result = self._run_result(command, timeout=600)
         if not result.ok:
             exists, runtime_status = self.inspect_container_runtime(allocation.container_name)
             if not exists:
@@ -915,15 +1078,46 @@ fi
 
         try:
             self.verify_container_access(allocation)
+            if allocation.pending_rebuild:
+                self.sync_runtime_shm_size(allocation)
         except Exception:
-            self.runner.run(f"docker stop {shlex.quote(allocation.container_name)}", timeout=120)
+            self._run_result(f"docker stop {shlex.quote(allocation.container_name)}", timeout=120)
             self.reconcile_allocation_state(allocation)
             raise
         allocation.status = AllocationStatus.RUNNING.value
 
+    def restart_container(self, allocation: Allocation, logs: list[str] | None = None) -> None:
+        command = f"docker restart {shlex.quote(allocation.container_name)}"
+        self._log(logs, f"重启端口 {allocation.host_port} 容器")
+        result = self._run_result(command, timeout=900)
+        if not result.ok:
+            exists, runtime_status = self.inspect_container_runtime(allocation.container_name)
+            if not exists:
+                allocation.status = AllocationStatus.DELETED.value
+            elif runtime_status == "running":
+                allocation.status = AllocationStatus.RUNNING.value
+            elif runtime_status:
+                allocation.status = AllocationStatus.STOPPED.value
+            raise RunnerError(
+                result.stderr or result.stdout or f"Command failed: {command}",
+                command=command,
+                exit_code=result.exit_code,
+                stderr=result.stderr,
+                stdout=result.stdout,
+            )
+        try:
+            self.verify_container_access(allocation)
+            if allocation.pending_rebuild:
+                self.sync_runtime_shm_size(allocation, logs=logs)
+        except Exception:
+            self.reconcile_allocation_state(allocation)
+            raise
+        allocation.status = AllocationStatus.RUNNING.value
+        self._log(logs, f"端口 {allocation.host_port} 容器已重启")
+
     def start_container_by_name(self, container_name: str) -> str:
         command = f"docker start {shlex.quote(container_name)}"
-        result = self.runner.run(command, timeout=600)
+        result = self._run_result(command, timeout=600)
         if not result.ok:
             exists, runtime_status = self.inspect_container_runtime(container_name)
             if not exists:
@@ -948,7 +1142,7 @@ fi
     def restart_container_by_name(self, container_name: str, logs: list[str] | None = None) -> str:
         command = f"docker restart {shlex.quote(container_name)}"
         self._log(logs, f"重启容器 {container_name}")
-        result = self.runner.run(command, timeout=900)
+        result = self._run_result(command, timeout=900)
         if not result.ok:
             exists, runtime_status = self.inspect_container_runtime(container_name)
             if not exists:
@@ -973,7 +1167,7 @@ fi
 
     def remove_image(self, image_ref: str) -> None:
         command = f"docker rmi -f {shlex.quote(image_ref)}"
-        result = self.runner.run(command, timeout=600)
+        result = self._run_result(command, timeout=600)
         if not result.ok:
             raise RunnerError(
                 result.stderr or result.stdout or f"Command failed: {command}",

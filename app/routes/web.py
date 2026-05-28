@@ -15,7 +15,12 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import SessionLocal
 from app.models import AdminStatus, AdminUser, Allocation, AllocationStatus, AuthType, HostStatusCache, ManagedHost, SnapshotRecord
-from app.services.admission import ACTIVE_STATUSES, check_allocation, recommended_defaults
+from app.services.admission import (
+    check_allocation,
+    guarantee_from_elastic,
+    recommended_defaults,
+    reservation_summary_from_rows,
+)
 from app.services.docker_engine import DockerService, slugify
 from app.services.host_cache import schedule_host_refresh
 from app.services.image_filters import filter_supported_base_images, is_supported_base_image
@@ -66,10 +71,60 @@ def split_error_payload(raw: str) -> tuple[str, str]:
     return parts[0], text
 
 
+def chinese_error_summary(text: str, fallback_message: str = "操作失败。") -> str:
+    raw = (text or "").strip()
+    lower = raw.lower()
+    if not raw:
+        return fallback_message
+    if "address already in use" in lower or "port is already allocated" in lower or "bind" in lower and "already in use" in lower:
+        return "端口已被占用，请更换端口或先清理占用该端口的旧容器。"
+    if "no such image" in lower or "pull access denied" in lower or "not found" in lower and "image" in lower:
+        return "宿主机本地没有找到指定基础镜像，请重新选择本机已有的 PyTorch/CUDA 镜像。"
+    if "no space left on device" in lower:
+        return "宿主机磁盘空间不足，Docker 无法继续写入数据。"
+    if "minimum memory limit" in lower or "memoryswap" in lower or "memory" in lower and "invalid" in lower:
+        return "Docker 内存上限参数不合法，请调高内存弹性上限后重试。"
+    if "cannot update memory limit" in lower or "memory limit should be smaller" in lower:
+        return "Docker 拒绝更新内存上限，可能低于当前容器占用或低于 Docker 允许范围。"
+    if "invalid argument" in lower and "--cpus" in lower:
+        return "CPU 弹性上限参数不合法，请填写大于 0 的整数核数。"
+    if "name is already in use" in lower or "conflict" in lower and "container name" in lower:
+        return "容器名已被占用，平台已尝试清理残留；如仍失败，请检查同名容器。"
+    if "driver/library version mismatch" in lower or "failed to initialize nvml" in lower:
+        return "NVIDIA 驱动与 NVML 库版本不匹配，宿主机 GPU 运行环境需要管理员修复。"
+    if "nvidia-container" in lower or "nvidia runtime" in lower:
+        return "NVIDIA 容器运行时异常，平台已尝试自动修复；仍失败时需要检查宿主机 GPU runtime。"
+    if "permission denied" in lower:
+        return "权限不足，当前 SSH 用户无法完成该 Docker 操作。"
+    if "connection timed out" in lower or "timed out" in lower or "timeout" in lower:
+        return "后端等待宿主机命令超时，请检查 SSH、Docker 负载或稍后重试。"
+    if "ssh" in lower and ("authentication" in lower or "auth" in lower):
+        return "SSH 认证失败，请检查账号、密码或私钥配置。"
+    if "ssh" in lower:
+        return "SSH 连接或远端命令执行失败，请检查宿主机网络和 SSH 服务。"
+    if raw and not any("\u4e00" <= ch <= "\u9fff" for ch in raw):
+        return f"{fallback_message} 后端返回英文错误，已保留原始日志供排查。"
+    return fallback_message
+
+
+def localize_error_log(text: str, fallback_message: str = "操作失败。") -> str:
+    raw = (text or "").strip()
+    summary = chinese_error_summary(raw, fallback_message)
+    if not raw:
+        return summary
+    if raw.startswith("中文解释："):
+        return raw
+    if summary and summary not in raw:
+        return f"中文解释：{summary}\n\n原始后端日志：\n{raw}"
+    return raw
+
+
 def runner_error_payload(exc: RunnerError, fallback_message: str) -> tuple[str, str]:
-    summary = fallback_message.strip() or str(exc).strip() or "操作失败。"
     error_log = exc.log_text() or str(exc).strip()
-    return summary, error_log
+    summary = chinese_error_summary(error_log, fallback_message.strip() or "操作失败。")
+    if summary == (fallback_message.strip() or "操作失败。") and str(exc).strip():
+        summary = split_error_payload(str(exc).strip())[0]
+    return summary, localize_error_log(error_log, summary)
 
 
 def ajax_response(request: Request, ok: bool, message: str, error_log: str = "", status_code: int = 200):
@@ -89,7 +144,8 @@ def operation_success(request: Request, message: str, redirect_url: str):
 
 def operation_error(request: Request, message: str, redirect_url: str, status_code: int = 200):
     if wants_json(request):
-        summary, error_log = split_error_payload(message)
+        summary = chinese_error_summary(message, split_error_payload(message)[0])
+        error_log = localize_error_log(message, summary)
         return JSONResponse(
             {"ok": False, "message": summary, "error_log": error_log},
             status_code=status_code,
@@ -625,6 +681,9 @@ def build_host_rows_from_cached_data(host: ManagedHost, db_allocations: list[All
                 "cpu_limit_cores": round(float(allocation.cpu_limit_cores or 0.0), 2) if allocation else 0.0,
                 "memory_limit_gb": round(float(allocation.memory_limit_gb or 0.0), 2) if allocation else 0.0,
                 "workspace_limit_gb": round(float(allocation.workspace_limit_gb or 0.0), 2) if allocation else 0.0,
+                "cpu_guarantee_cores": guarantee_from_elastic(allocation.cpu_limit_cores) if allocation else 0.0,
+                "memory_guarantee_gb": guarantee_from_elastic(allocation.memory_limit_gb) if allocation else 0.0,
+                "workspace_guarantee_gb": guarantee_from_elastic(allocation.workspace_limit_gb) if allocation else 0.0,
             }
         )
 
@@ -726,6 +785,31 @@ def build_host_rows_from_cached_data(host: ManagedHost, db_allocations: list[All
         "allocation_rows": allocation_rows,
         "unified_container_rows": sorted(unified_container_rows, key=lambda row: row["host_port"]),
         "resource_chart_rows": resource_chart_rows,
+    }
+
+
+def summarize_resource_reservations(rows_data: dict) -> dict:
+    reservation = reservation_summary_from_rows(rows_data.get("resource_chart_rows") or [])
+    gpu_actual_gb = (
+        sum(float(row.get("gpu_memory_used_mb") or 0.0) for row in rows_data.get("resource_chart_rows") or [])
+        / 1024
+    )
+    return {
+        "allocated_cpu": reservation.elastic_cpu,
+        "allocated_memory_gb": reservation.elastic_memory_gb,
+        "allocated_disk_gb": reservation.elastic_disk_gb,
+        "guaranteed_cpu": reservation.guarantee_cpu,
+        "guaranteed_memory_gb": reservation.guarantee_memory_gb,
+        "guaranteed_disk_gb": reservation.guarantee_disk_gb,
+        "reserved_cpu": reservation.reserved_cpu,
+        "reserved_memory_gb": reservation.reserved_memory_gb,
+        "reserved_disk_gb": reservation.reserved_disk_gb,
+        "actual_cpu": reservation.actual_cpu,
+        "actual_memory_gb": reservation.actual_memory_gb,
+        "actual_disk_gb": reservation.actual_disk_gb,
+        "allocated_payload": reservation.elastic_payload(gpu_actual_gb),
+        "guaranteed_payload": reservation.guarantee_payload(),
+        "reserved_payload": reservation.reserved_payload(),
     }
 
 
@@ -1348,15 +1432,15 @@ def dashboard(request: Request):
         for host in hosts:
             cached = host_cache_payload(host)
             rows_data = build_host_rows_from_cached_data(host, list(host.allocations), cached)
+            resource_summary = summarize_resource_reservations(rows_data)
             summary = {
                 "reachable": cached["reachable"],
                 "docker_info": cached["docker_info"],
                 "stats": cached["stats"],
                 "gpus": cached["gpus"],
-                "allocated_cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in rows_data["allocation_rows"]),
-                "allocated_memory_gb": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in rows_data["allocation_rows"]),
                 "active_allocations": sum(1 for row in rows_data["allocation_rows"] if row["status"] == AllocationStatus.RUNNING.value),
                 "container_count": len(cached["container_rows"]),
+                **resource_summary,
             }
             total_cpu = float(summary["docker_info"].get("NCPU") or 0)
             total_memory_gb = float(summary["docker_info"].get("MemTotal") or 0) / (1024**3)
@@ -1406,15 +1490,15 @@ def hosts_page(request: Request):
         for host in hosts:
             cached = host_cache_payload(host)
             rows_data = build_host_rows_from_cached_data(host, list(host.allocations), cached)
+            resource_summary = summarize_resource_reservations(rows_data)
             summary = {
                 "reachable": cached["reachable"],
                 "docker_info": cached["docker_info"],
                 "stats": cached["stats"],
                 "gpus": cached["gpus"],
-                "allocated_cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in rows_data["allocation_rows"]),
-                "allocated_memory_gb": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in rows_data["allocation_rows"]),
                 "active_allocations": sum(1 for row in rows_data["allocation_rows"] if row["status"] == AllocationStatus.RUNNING.value),
                 "container_count": len(cached["container_rows"]),
+                **resource_summary,
             }
             defaults = recommended_defaults(host, summary["docker_info"])
             host_rows.append({"host": host, "summary": summary, "defaults": defaults, "last_status_at": format_cache_time(cached["refreshed_at"])})
@@ -2061,6 +2145,7 @@ def host_detail(request: Request, host_id: int):
         allocation_rows = rows_data["allocation_rows"]
         unified_container_rows = rows_data["unified_container_rows"]
         resource_chart_rows = rows_data["resource_chart_rows"]
+        resource_summary = summarize_resource_reservations(rows_data)
         docker_info = cached["docker_info"]
         root_disk_usage = resolve_root_disk_usage(host, docker_info)
         workspace_disk_usage = resolve_workspace_disk_usage(docker_info)
@@ -2084,9 +2169,6 @@ def host_detail(request: Request, host_id: int):
             "docker_info": docker_info,
             "stats": cached["stats"],
             "gpus": cached["gpus"],
-            "allocated_cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in allocation_rows),
-            "allocated_memory_gb": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in allocation_rows),
-            "allocated_disk_gb": sum(float(row["allocation"].workspace_limit_gb or 0.0) for row in allocation_rows),
             "active_allocations": sum(1 for row in allocation_rows if row["status"] == AllocationStatus.RUNNING.value),
             "container_count": len(cached["container_rows"]),
             "total_cpu_cores": float(docker_info.get("NCPU") or 0),
@@ -2095,6 +2177,7 @@ def host_detail(request: Request, host_id: int):
             "root_disk_used_gb": float(root_disk_usage.get("used_gb") or 0),
             "workspace_disk_total_gb": float(workspace_disk_usage.get("total_gb") or root_disk_usage.get("total_gb") or 0),
             "workspace_disk_used_gb": float(workspace_disk_usage.get("used_gb") or root_disk_usage.get("used_gb") or 0),
+            **resource_summary,
         }
         defaults = recommended_defaults(host, cached["docker_info"])
         port_state = host_port_pool_state(host, db_allocations, cached["container_rows"])
@@ -2588,16 +2671,10 @@ def host_metrics(host_id: int):
             .all()
         )
         rows_data = build_host_rows_from_cached_data(host, db_allocations, cached)
-        active_allocation_rows = [
-            row for row in rows_data["allocation_rows"]
-            if row["allocation"].status in ACTIVE_STATUSES
-        ]
-        allocated_payload = {
-            "cpu": sum(float(row["allocation"].cpu_limit_cores or 0.0) for row in active_allocation_rows),
-            "memory": sum(float(row["allocation"].memory_limit_gb or 0.0) for row in active_allocation_rows),
-            "disk": sum(float(row["allocation"].workspace_limit_gb or 0.0) for row in active_allocation_rows),
-            "gpu": sum(float(row.get("gpu_memory_used_mb") or 0.0) for row in rows_data["resource_chart_rows"]) / 1024,
-        }
+        resource_summary = summarize_resource_reservations(rows_data)
+        allocated_payload = resource_summary["allocated_payload"]
+        guaranteed_payload = resource_summary["guaranteed_payload"]
+        reserved_payload = resource_summary["reserved_payload"]
         if cache_needs_full_refresh(host, cached, db) and not cached["container_rows"]:
             return JSONResponse(
                 {
@@ -2609,6 +2686,8 @@ def host_metrics(host_id: int):
                     "last_status_at": "正在更新",
                     "rows": rows_data["resource_chart_rows"],
                     "allocated": allocated_payload,
+                    "guaranteed": guaranteed_payload,
+                    "reserved": reserved_payload,
                     "gpus": cached["gpus"],
                     "refresh_in_progress": cached["refresh_in_progress"],
                 },
@@ -2626,6 +2705,8 @@ def host_metrics(host_id: int):
                     "refresh_started_at": format_cache_time(cached["refresh_started_at"]),
                     "rows": rows_data["resource_chart_rows"],
                     "allocated": allocated_payload,
+                    "guaranteed": guaranteed_payload,
+                    "reserved": reserved_payload,
                     "gpus": cached["gpus"],
                 }
             )
@@ -2640,6 +2721,8 @@ def host_metrics(host_id: int):
                     "last_status_at": format_cache_time(cached["refreshed_at"]),
                     "rows": rows_data["resource_chart_rows"],
                     "allocated": allocated_payload,
+                    "guaranteed": guaranteed_payload,
+                    "reserved": reserved_payload,
                     "gpus": cached["gpus"],
                     "refresh_in_progress": cached["refresh_in_progress"],
                 },
@@ -2653,6 +2736,8 @@ def host_metrics(host_id: int):
                 "last_status_at": format_cache_time(cached["refreshed_at"]),
                 "rows": rows_data["resource_chart_rows"],
                 "allocated": allocated_payload,
+                "guaranteed": guaranteed_payload,
+                "reserved": reserved_payload,
                 "gpus": cached["gpus"],
                 "refresh_in_progress": cached["refresh_in_progress"],
             }
@@ -2699,6 +2784,7 @@ def create_allocation(
     db: Session = SessionLocal()
     host = None
     container_name = ""
+    container_created = False
     logs: list[str] = []
     try:
         host = visible_host_by_id(db, host_id)
@@ -2743,11 +2829,19 @@ def create_allocation(
             used_ports = docker.used_host_ports() if reachable else set()
             if host_port in used_ports:
                 return operation_error(request, f"端口 {host_port} 已被 Docker 实际占用，请选择其他端口。", redirect_url)
-        logs.append("检查准入配额")
+        logs.append("检查弹性资源准入")
         decision = check_allocation(db, host, cpu_limit_cores, memory_limit_gb, workspace_limit_gb)
         logs.extend(decision.warnings or [])
         if not decision.allowed:
             reason = "；".join(decision.reasons)
+            if is_ajax:
+                return log_response(
+                    logs + ["弹性资源准入失败"],
+                    ok=False,
+                    message=split_error_payload(reason)[0],
+                    error_log=reason,
+                    status_code=200,
+                )
             return operation_error(request, reason, redirect_url)
 
         selected_image = (base_image_override or "").strip()
@@ -2788,6 +2882,7 @@ def create_allocation(
         db.flush()
         logs.append("开始创建并验证容器")
         DockerService(host).create_container(allocation, logs=logs)
+        container_created = True
         upsert_cached_container_row(
             db,
             host.id,
@@ -2816,11 +2911,40 @@ def create_allocation(
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
+        if host and container_name and container_created:
+            try:
+                logs.append("数据库写入失败，清理已创建容器以保持平台状态一致。")
+                DockerService(host).cleanup_failed_container(allocation, logs=logs)
+            except Exception as cleanup_exc:
+                logs.append(f"已回滚数据库事务，但清理已创建容器失败：{cleanup_exc}")
+        if is_ajax:
+            return log_response(
+                logs + ["数据库写入失败，已回滚事务"],
+                ok=False,
+                message="数据库写入失败。",
+                error_log=localize_error_log(reason, "数据库写入失败。"),
+                status_code=200,
+            )
         return operation_error(request, reason, redirect_url)
     except Exception as exc:
         db.rollback()
-        reason = str(exc).strip()
-        return operation_error(request, reason, redirect_url)
+        raw_error = str(exc).strip()
+        reason = chinese_error_summary(raw_error, "容器创建失败。")
+        if host and container_name and container_created:
+            try:
+                logs.append("创建流程后段失败，清理已创建容器以保持平台状态一致。")
+                DockerService(host).cleanup_failed_container(allocation, logs=logs)
+            except Exception as cleanup_exc:
+                logs.append(f"已回滚数据库事务，但清理已创建容器失败：{cleanup_exc}")
+        if is_ajax:
+            return log_response(
+                logs + ["容器创建失败，已回滚数据库事务"],
+                ok=False,
+                message=reason,
+                error_log=localize_error_log(raw_error, reason),
+                status_code=200,
+            )
+        return operation_error(request, raw_error or reason, redirect_url)
     finally:
         db.close()
 
@@ -2860,33 +2984,57 @@ def update_allocation_resources(
         logs.extend(decision.warnings or [])
         if not decision.allowed:
             reason = "；".join(decision.reasons)
+            if is_ajax:
+                return log_response(
+                    logs + ["弹性资源准入失败"],
+                    ok=False,
+                    message=split_error_payload(reason)[0],
+                    error_log=reason,
+                    status_code=200,
+                )
             return operation_error(request, reason, redirect_url)
 
         allocation.cpu_limit_cores = cpu_limit_cores
         allocation.memory_limit_gb = memory_limit_gb
         allocation.workspace_limit_gb = workspace_limit_gb
-        logs.append(f"更新端口 {allocation.host_port} 资源配置")
+        logs.append(f"更新端口 {allocation.host_port} 弹性资源上限")
+        docker_updated = False
         try:
             DockerService(allocation.host).update_resources(allocation, logs=logs)
+            docker_updated = True
             db.commit()
             if is_ajax:
-                return log_response(logs + ["资源更新成功"], ok=True, message=f"端口 {allocation.host_port} 资源上限已更新。")
-            return operation_success(request, f"端口 {allocation.host_port} 资源上限已更新。", redirect_url)
+                return log_response(logs + ["资源更新成功"], ok=True, message=f"端口 {allocation.host_port} 弹性资源上限已更新。")
+            return operation_success(request, f"端口 {allocation.host_port} 弹性资源上限已更新。", redirect_url)
         except Exception:
             allocation.cpu_limit_cores = original_state["cpu_limit_cores"]
             allocation.memory_limit_gb = original_state["memory_limit_gb"]
             allocation.workspace_limit_gb = original_state["workspace_limit_gb"]
             db.rollback()
+            if docker_updated:
+                try:
+                    logs.append("数据库提交失败，尝试恢复容器原弹性资源上限，避免 Docker 与平台记录不一致。")
+                    DockerService(allocation.host).update_resources(allocation, logs=logs)
+                except Exception as rollback_exc:
+                    logs.append(f"容器原资源上限恢复失败，请人工核对该容器：{rollback_exc}")
             raise
     except RunnerError as exc:
         db.rollback()
         summary, error_log = runner_error_payload(exc, "资源更新失败。")
         if is_ajax:
-            return JSONResponse({"ok": False, "message": summary, "error_log": error_log}, status_code=200)
+            return log_response(logs + ["资源更新失败，数据库事务已回滚"], ok=False, message=summary, error_log=error_log, status_code=200)
         return operation_error(request, error_log, redirect_url)
     except SQLAlchemyError as exc:
         db.rollback()
         reason = str(exc).strip()
+        if is_ajax:
+            return log_response(
+                logs + ["数据库写入失败，已回滚事务"],
+                ok=False,
+                message="数据库写入失败。",
+                error_log=reason,
+                status_code=200,
+            )
         return operation_error(request, reason, redirect_url)
     except ValueError as exc:
         db.rollback()
@@ -3004,6 +3152,33 @@ def allocation_action(
                     logs.append("已同步平台缓存状态为 running")
                 success_message = f"端口 {allocation.host_port} 已启动。"
             schedule_host_refresh(allocation.host_id, full=False)
+        elif action == "restart":
+            if allocation.pending_rebuild:
+                logs.append("检测到需重建状态，准备重建后启动")
+                docker.rebuild_container(allocation, logs=logs)
+                upsert_cached_container_row(
+                    db,
+                    allocation.host_id,
+                    allocation.container_name,
+                    allocation.host_port,
+                    allocation.image_name,
+                    allocation.status,
+                )
+                success_message = f"端口 {allocation.host_port} 已按最新配置重建并启动。"
+            else:
+                logs.append(f"尝试重启端口 {allocation.host_port}")
+                docker.restart_container(allocation, logs=logs)
+                if update_cached_container_status(
+                    db,
+                    allocation.host_id,
+                    allocation.container_name,
+                    allocation.status,
+                    allocation.host_port,
+                    allocation.image_name,
+                ):
+                    logs.append("已同步平台缓存状态为 running")
+                success_message = f"端口 {allocation.host_port} 已重启。"
+            schedule_host_refresh(allocation.host_id, full=False)
         elif action == "delete":
             logs.append(f"尝试删除端口 {allocation.host_port} 容器")
             deleted_container_name = allocation.container_name
@@ -3037,6 +3212,7 @@ def allocation_action(
         action_message = {
             "stop": "停止操作失败。",
             "start": "启动操作失败。",
+            "restart": "重启操作失败。",
             "delete": "删除操作失败。",
         }.get(action, "维护操作失败。")
         summary, error_log = runner_error_payload(exc, action_message)
@@ -3101,6 +3277,12 @@ def external_container_action(
             schedule_host_refresh(host.id, full=False)
             db.commit()
             message = f"容器 {container_name} 已启动。"
+        elif action == "restart":
+            runtime_status = docker.restart_container_by_name(container_name)
+            update_cached_container_status(db, host.id, container_name, runtime_status)
+            schedule_host_refresh(host.id, full=False)
+            db.commit()
+            message = f"容器 {container_name} 已重启。"
         elif action == "delete":
             docker.remove_container_by_name(container_name)
             cache_changed = remove_cached_container_row(db, host.id, container_name)
