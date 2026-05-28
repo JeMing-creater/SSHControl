@@ -1,22 +1,44 @@
+# Python bytecode and tool caches
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
+# Local virtual environments
 .env
+.env.*
+!.env.example
 .venv/
 venv/
 env/
 
-data/*.db
-data/*.db-*
-data/*.sqlite
-data/*.sqlite3
+# Runtime data. Keep data/.gitkeep if one is added later.
+data/*
+!data/.gitkeep
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
 
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
+# Logs, pid files, and local run outputs
 *.log
 *.pid
+nohup.out
+*.out
 
+# Local deployment handoff notes that may contain host addresses/passwords.
+HANDOFF_*.md
+MIGRATION_CHECKLIST_*.md
+
+# OS/editor noise
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
